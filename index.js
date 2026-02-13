@@ -9,7 +9,64 @@ const PORT = process.env.PORT || 3001;
 const HEARTBEAT_INTERVAL = 30000;
 const REPORTS_TO_AUTO_BAN = 3;
 const BAN_DATA_FILE = path.join(__dirname, 'bans.json');
+const COINS_DATA_FILE = path.join(__dirname, 'coins.json');
 const UNBAN_PRICE_CENTS = 799; // $7.99
+
+// ─── Gift Catalog ───
+const GIFTS = {
+  rose:    { name: 'Rose',    emoji: '🌹', cost: 5 },
+  heart:   { name: 'Heart',   emoji: '❤️', cost: 10 },
+  fire:    { name: 'Fire',    emoji: '🔥', cost: 15 },
+  star:    { name: 'Star',    emoji: '⭐', cost: 25 },
+  crown:   { name: 'Crown',   emoji: '👑', cost: 50 },
+  diamond: { name: 'Diamond', emoji: '💎', cost: 100 },
+  rocket:  { name: 'Rocket',  emoji: '🚀', cost: 200 },
+  galaxy:  { name: 'Galaxy',  emoji: '🌌', cost: 500 },
+};
+
+// ─── Coin Packages ───
+const COIN_PACKAGES = {
+  pack1: { coins: 100,  price: '0.99',  label: '100 M Coins' },
+  pack2: { coins: 600,  price: '4.99',  label: '600 M Coins' },
+  pack3: { coins: 1500, price: '9.99',  label: '1,500 M Coins' },
+  pack4: { coins: 5000, price: '24.99', label: '5,000 M Coins' },
+};
+
+// ─── Coins Persistence ───
+let coinsData = { balances: {}, transactions: [], totalRevenue: 0, totalGifts: 0 };
+// balances: { "ip": coinCount }
+
+function loadCoins() {
+  try {
+    if (fs.existsSync(COINS_DATA_FILE)) {
+      coinsData = JSON.parse(fs.readFileSync(COINS_DATA_FILE, 'utf8'));
+      console.log(`[COINS] Loaded ${Object.keys(coinsData.balances).length} balances`);
+    }
+  } catch (e) { console.error('[COINS] Load error:', e.message); }
+}
+
+function saveCoins() {
+  try { fs.writeFileSync(COINS_DATA_FILE, JSON.stringify(coinsData, null, 2)); }
+  catch (e) { console.error('[COINS] Save error:', e.message); }
+}
+
+function getBalance(ip) { return coinsData.balances[ip] || 0; }
+
+function addCoins(ip, amount, reason) {
+  coinsData.balances[ip] = (coinsData.balances[ip] || 0) + amount;
+  coinsData.transactions.push({ ip: ip.slice(0, 8) + '***', amount, reason, timestamp: new Date().toISOString() });
+  if (coinsData.transactions.length > 500) coinsData.transactions = coinsData.transactions.slice(-500);
+  saveCoins();
+}
+
+function spendCoins(ip, amount) {
+  if ((coinsData.balances[ip] || 0) < amount) return false;
+  coinsData.balances[ip] -= amount;
+  saveCoins();
+  return true;
+}
+
+loadCoins();
 
 // ─── Admin Config ───
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
@@ -327,6 +384,141 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ═══════════════════════════════════════════
+  // M COINS API
+  // ═══════════════════════════════════════════
+
+  // Get coin balance
+  if (req.url === '/coins/balance') {
+    const ip = getClientIP(req);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ balance: getBalance(ip) }));
+    return;
+  }
+
+  // Get gift catalog and packages
+  if (req.url === '/coins/catalog') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ gifts: GIFTS, packages: COIN_PACKAGES }));
+    return;
+  }
+
+  // Create PayPal order for coin purchase
+  if (req.url === '/coins/create-order' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      const ip = getClientIP(req);
+      const pack = COIN_PACKAGES[data.packageId];
+
+      if (!pack) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid package' }));
+        return;
+      }
+
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live'
+        ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+
+      if (!clientId || !clientSecret) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'PayPal not configured' }));
+        return;
+      }
+
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      const orderRes = await fetch(`${paypalBase}/v2/checkout/orders`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${authData.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          intent: 'CAPTURE',
+          purchase_units: [{
+            amount: { currency_code: 'USD', value: pack.price },
+            description: `MingleNow ${pack.label}`,
+            custom_id: `coins|${ip}|${data.packageId}`,
+          }],
+        }),
+      });
+      const orderData = await orderRes.json();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ orderId: orderData.id }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Capture PayPal coin purchase
+  if (req.url === '/coins/capture-order' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      const ip = getClientIP(req);
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live'
+        ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      const captureRes = await fetch(`${paypalBase}/v2/checkout/orders/${data.orderId}/capture`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${authData.access_token}`, 'Content-Type': 'application/json' },
+      });
+      const captureData = await captureRes.json();
+
+      if (captureData.status === 'COMPLETED') {
+        const customId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id || '';
+        const [, buyerIP, packageId] = customId.split('|');
+        const pack = COIN_PACKAGES[packageId];
+        const targetIP = buyerIP || ip;
+
+        if (pack) {
+          addCoins(targetIP, pack.coins, `Purchased ${pack.label} ($${pack.price})`);
+          coinsData.totalRevenue = (coinsData.totalRevenue || 0) + parseFloat(pack.price);
+          saveCoins();
+          console.log(`[COINS] ${targetIP.slice(0, 8)}*** bought ${pack.label}`);
+
+          // Notify the user's websocket if they're connected
+          clients.forEach((d, ws) => {
+            if (d.ip === targetIP) send(ws, { type: 'coins_updated', balance: getBalance(targetIP) });
+          });
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, balance: getBalance(targetIP) }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false }));
+      }
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ═══════════════════════════════════════════
   // ADMIN API
   // ═══════════════════════════════════════════
 
@@ -383,7 +575,9 @@ const server = http.createServer(async (req, res) => {
       connected: connectedPairs.size,
       totalBans: activeBans.length,
       totalUnbans: paidUnbans.length,
-      revenue: paidUnbans.length * 7.99,
+      revenue: paidUnbans.length * 7.99 + (coinsData.totalRevenue || 0),
+      coinRevenue: coinsData.totalRevenue || 0,
+      totalGifts: coinsData.totalGifts || 0,
       recentBans: banData.banLog.slice(-50).reverse(),
       onlineUsers,
     }));
@@ -577,7 +771,7 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0 });
-  send(ws, { type: 'welcome', id, online: clients.size });
+  send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip) });
 
   ws.on('message', (raw) => {
     let msg;
@@ -646,6 +840,32 @@ wss.on('connection', (ws, req) => {
         }
         break;
       }
+      // ─── Send Gift ───
+      case 'send_gift': {
+        if (cd.partner && typeof msg.giftId === 'string') {
+          const gift = GIFTS[msg.giftId];
+          if (!gift) break;
+          if (!spendCoins(cd.ip, gift.cost)) {
+            send(ws, { type: 'gift_error', message: 'Not enough M Coins!' });
+            break;
+          }
+          coinsData.totalGifts = (coinsData.totalGifts || 0) + 1;
+          saveCoins();
+          // Send to both sender and receiver
+          const giftMsg = { type: 'gift_received', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, from: 'stranger' };
+          send(cd.partner, giftMsg);
+          send(ws, { type: 'gift_sent', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, balance: getBalance(cd.ip) });
+          console.log(`[GIFT] ${cd.id} sent ${gift.name} (${gift.cost} coins)`);
+        }
+        break;
+      }
+
+      // ─── Get Balance via WS ───
+      case 'get_balance': {
+        send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+        break;
+      }
+
       case 'pong': { cd.alive = true; break; }
     }
   });
