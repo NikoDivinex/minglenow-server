@@ -8,8 +8,7 @@
     "dev": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.16.0",
-    "stripe": "^14.0.0"
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
