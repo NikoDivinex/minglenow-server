@@ -33,8 +33,45 @@ const COIN_PACKAGES = {
 };
 
 // ─── Coins Persistence ───
-let coinsData = { balances: {}, transactions: [], totalRevenue: 0, totalGifts: 0 };
+let coinsData = { balances: {}, transactions: [], totalRevenue: 0, totalGifts: 0, perks: {}, recentPartners: {} };
 // balances: { "ip": coinCount }
+// perks: { "ip": { nameColor: "gold", bubbleTheme: "neon", entrance: "fire", region: "us" } }
+// recentPartners: { "ip": ["partnerId1","partnerId2"...] }
+
+// ─── Perks Shop ───
+const PERKS = {
+  nameColors: {
+    gold:    { name: 'Gold',    color: '#f1c40f', cost: 50 },
+    purple:  { name: 'Purple',  color: '#a55eea', cost: 50 },
+    red:     { name: 'Red',     color: '#e84393', cost: 50 },
+    cyan:    { name: 'Cyan',    color: '#00cec9', cost: 50 },
+    green:   { name: 'Green',   color: '#00b894', cost: 50 },
+    rainbow: { name: 'Rainbow', color: 'rainbow',  cost: 150 },
+  },
+  bubbleThemes: {
+    neon:     { name: 'Neon Glow',   cost: 75 },
+    gradient: { name: 'Gradient',    cost: 75 },
+    dark:     { name: 'Dark Mode',   cost: 75 },
+    retro:    { name: 'Retro',       cost: 100 },
+    royal:    { name: 'Royal Gold',  cost: 150 },
+  },
+  entrances: {
+    fire:    { name: 'Fire Entrance',    emoji: '🔥', cost: 100 },
+    star:    { name: 'Star Entrance',    emoji: '⭐', cost: 100 },
+    crown:   { name: 'VIP Entrance',     emoji: '👑', cost: 200 },
+    diamond: { name: 'Diamond Entrance', emoji: '💎', cost: 300 },
+    rocket:  { name: 'Rocket Entrance',  emoji: '🚀', cost: 500 },
+  },
+  regions: {
+    any: { name: 'Any Region', cost: 0 },
+    us:  { name: 'North America', cost: 25 },
+    eu:  { name: 'Europe', cost: 25 },
+    asia:{ name: 'Asia', cost: 25 },
+    latam:{ name: 'Latin America', cost: 25 },
+    mena:{ name: 'Middle East', cost: 25 },
+  },
+  reconnectCost: 50,
+};
 
 function loadCoins() {
   try {
@@ -67,6 +104,32 @@ function spendCoins(ip, amount) {
 }
 
 loadCoins();
+
+function getUserPerks(ip) {
+  return coinsData.perks?.[ip] || {};
+}
+
+function setUserPerk(ip, perkType, perkId) {
+  if (!coinsData.perks) coinsData.perks = {};
+  if (!coinsData.perks[ip]) coinsData.perks[ip] = {};
+  coinsData.perks[ip][perkType] = perkId;
+  saveCoins();
+}
+
+function getRecentPartners(ip) {
+  return coinsData.recentPartners?.[ip] || [];
+}
+
+function addRecentPartner(ip, partnerId, partnerIp) {
+  if (!coinsData.recentPartners) coinsData.recentPartners = {};
+  if (!coinsData.recentPartners[ip]) coinsData.recentPartners[ip] = [];
+  // Store last 10 partners
+  const list = coinsData.recentPartners[ip];
+  const entry = { id: partnerId, ip: partnerIp, timestamp: Date.now() };
+  list.unshift(entry);
+  if (list.length > 10) list.length = 10;
+  saveCoins();
+}
 
 // ─── Admin Config ───
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
@@ -518,6 +581,71 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Get perks shop catalog
+  if (req.url === '/perks/catalog') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ perks: PERKS }));
+    return;
+  }
+
+  // Get user's active perks
+  if (req.url === '/perks/mine') {
+    const ip = getClientIP(req);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ perks: getUserPerks(ip), balance: getBalance(ip) }));
+    return;
+  }
+
+  // Buy a perk
+  if (req.url === '/perks/buy' && req.method === 'POST') {
+    const ip = getClientIP(req);
+    const data = await readBody(req);
+    const { type, id } = data; // type: nameColor, bubbleTheme, entrance, region
+
+    let cost = 0;
+    let valid = false;
+    if (id === 'none') {
+      // Clear this perk type - free
+      valid = true; cost = 0;
+    } else if (type === 'nameColor' && PERKS.nameColors[id]) { cost = PERKS.nameColors[id].cost; valid = true; }
+    else if (type === 'bubbleTheme' && PERKS.bubbleThemes[id]) { cost = PERKS.bubbleThemes[id].cost; valid = true; }
+    else if (type === 'entrance' && PERKS.entrances[id]) { cost = PERKS.entrances[id].cost; valid = true; }
+    else if (type === 'region' && PERKS.regions[id]) { cost = PERKS.regions[id].cost; valid = true; }
+
+    if (!valid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid perk' }));
+      return;
+    }
+
+    // Check if already owned (no charge for re-equipping same)
+    const current = getUserPerks(ip);
+    if (current[type] === id) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, message: 'Already equipped', balance: getBalance(ip), perks: getUserPerks(ip) }));
+      return;
+    }
+
+    if (cost > 0 && !spendCoins(ip, cost)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not enough coins', balance: getBalance(ip) }));
+      return;
+    }
+
+    setUserPerk(ip, type, id);
+
+    // Notify user's websocket
+    clients.forEach((d, ws) => {
+      if (d.ip === ip) {
+        send(ws, { type: 'perks_updated', perks: getUserPerks(ip), balance: getBalance(ip) });
+      }
+    });
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, balance: getBalance(ip), perks: getUserPerks(ip) }));
+    return;
+  }
+
   // ═══════════════════════════════════════════
   // ADMIN API
   // ═══════════════════════════════════════════
@@ -721,12 +849,21 @@ function calculateMatchScore(a, b) {
 function findBestMatch(ws) {
   const d = clients.get(ws);
   if (!d) return null;
+  const myPerks = getUserPerks(d.ip);
+  const myRegion = myPerks.region || 'any';
+
   let best = null, bestScore = -1;
   for (let i = 0; i < waitingQueue.length; i++) {
     const c = waitingQueue[i];
     if (c === ws || c.readyState !== 1) continue;
     const cd = clients.get(c);
     if (!cd || cd.partner) continue;
+    const theirPerks = getUserPerks(cd.ip);
+    const theirRegion = theirPerks.region || 'any';
+    // Region filter: skip if either has a region set and they don't match
+    if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
+    if (myRegion !== 'any' && theirRegion === 'any') { /* ok, they accept anyone */ }
+    if (myRegion === 'any' && theirRegion !== 'any') { /* ok, we accept anyone */ }
     const score = calculateMatchScore(d.interests, cd.interests);
     if (score > bestScore) { bestScore = score; best = { index: i, ws: c, score }; }
   }
@@ -736,6 +873,9 @@ function findBestMatch(ws) {
       if (c === ws || c.readyState !== 1) continue;
       const cd = clients.get(c);
       if (!cd || cd.partner) continue;
+      const theirPerks = getUserPerks(cd.ip);
+      const theirRegion = theirPerks.region || 'any';
+      if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
       best = { index: i, ws: c, score: 0 }; break;
     }
   }
@@ -753,8 +893,15 @@ function pairUsers(ws1, ws2) {
     const s = new Set(d1.interests.map(i => i.toLowerCase().trim()));
     for (const i of d2.interests) { if (s.has(i.toLowerCase().trim())) shared.push(i); }
   }
-  send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id, partnerUsername: d2.username || 'Stranger' });
-  send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id, partnerUsername: d1.username || 'Stranger' });
+  const p1 = getUserPerks(d1.ip);
+  const p2 = getUserPerks(d2.ip);
+  send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id,
+    partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance } });
+  send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id,
+    partnerUsername: d1.username || 'Stranger', partnerPerks: { nameColor: p1.nameColor, bubbleTheme: p1.bubbleTheme, entrance: p1.entrance } });
+  // Track recent partners for reconnect
+  addRecentPartner(d1.ip, d2.id, d2.ip);
+  addRecentPartner(d2.ip, d1.id, d1.ip);
   console.log(`[PAIR] ${d1.username || d1.id} <-> ${d2.username || d2.id}`);
 }
 
@@ -794,7 +941,7 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '' });
-  send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip) });
+  send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip), perks: getUserPerks(ip) });
 
   ws.on('message', (raw) => {
     let msg;
@@ -881,6 +1028,42 @@ wss.on('connection', (ws, req) => {
           send(cd.partner, giftMsg);
           send(ws, { type: 'gift_sent', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, balance: getBalance(cd.ip) });
           console.log(`[GIFT] ${cd.id} sent ${gift.name} (${gift.cost} coins)`);
+        }
+        break;
+      }
+
+      // ─── Reconnect with last partner ───
+      case 'reconnect': {
+        const cost = PERKS.reconnectCost;
+        if (!spendCoins(cd.ip, cost)) {
+          send(ws, { type: 'gift_error', message: `Need ${cost} M Coins to reconnect!` });
+          break;
+        }
+        send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+        const recent = getRecentPartners(cd.ip);
+        if (recent.length === 0) {
+          addCoins(cd.ip, cost, 'Reconnect refund - no history');
+          send(ws, { type: 'gift_error', message: 'No recent partners to reconnect with.' });
+          send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+          break;
+        }
+        // Try to find the most recent partner who is online and not paired
+        let found = false;
+        for (const p of recent) {
+          for (const [pws, pd] of clients.entries()) {
+            if (pd.ip === p.ip && !pd.partner && pws !== ws) {
+              unpairUser(ws); removeFromQueue(ws);
+              pairUsers(ws, pws);
+              found = true;
+              break;
+            }
+          }
+          if (found) break;
+        }
+        if (!found) {
+          addCoins(cd.ip, cost, 'Reconnect refund - partner offline');
+          send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+          send(ws, { type: 'gift_error', message: 'Your last partner is not available right now.' });
         }
         break;
       }
