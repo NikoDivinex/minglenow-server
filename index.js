@@ -194,8 +194,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Create Stripe checkout for unban
-  if (req.url === '/create-unban-session' && req.method === 'POST') {
+  // Create PayPal order for unban
+  if (req.url === '/create-unban-order' && req.method === 'POST') {
     try {
       const ip = getClientIP(req);
       const banInfo = getBanInfo(ip);
@@ -204,53 +204,125 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'Not banned' }));
         return;
       }
-      if (process.env.STRIPE_SECRET_KEY) {
-        const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-        const session = await stripe.checkout.sessions.create({
-          payment_method_types: ['card'],
-          line_items: [{
-            price_data: {
-              currency: 'usd',
-              product_data: { name: 'MingleNow Unban', description: 'Remove your ban and regain access' },
-              unit_amount: UNBAN_PRICE_CENTS,
-            },
-            quantity: 1,
-          }],
-          mode: 'payment',
-          success_url: `${req.headers.origin || 'https://uminglenow.com'}?unbanned=true`,
-          cancel_url: `${req.headers.origin || 'https://uminglenow.com'}?unbanned=false`,
-          metadata: { banned_ip: ip, unban_token: banInfo.unbanToken },
-        });
+
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live'
+        ? 'https://api-m.paypal.com'
+        : 'https://api-m.sandbox.paypal.com';
+
+      if (!clientId || !clientSecret) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ url: session.url }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Stripe not configured', message: 'Set STRIPE_SECRET_KEY on Railway' }));
+        res.end(JSON.stringify({ error: 'PayPal not configured', message: 'Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET on Railway' }));
+        return;
       }
+
+      // Get access token
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      // Create order
+      const orderRes = await fetch(`${paypalBase}/v2/checkout/orders`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${authData.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          intent: 'CAPTURE',
+          purchase_units: [{
+            amount: { currency_code: 'USD', value: '7.99' },
+            description: 'MingleNow Account Unban',
+            custom_id: `${ip}|${banInfo.unbanToken}`,
+          }],
+        }),
+      });
+      const orderData = await orderRes.json();
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ orderId: orderData.id }));
     } catch (e) {
+      console.error('[PAYPAL ERROR]', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
     }
     return;
   }
 
-  // Stripe webhook
-  if (req.url === '/webhook/stripe' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const event = JSON.parse(body);
-        if (event.type === 'checkout.session.completed') {
-          const s = event.data.object;
-          if (s.metadata?.banned_ip && s.metadata?.unban_token) {
-            const info = getBanInfo(s.metadata.banned_ip);
-            if (info && info.unbanToken === s.metadata.unban_token) unbanIP(s.metadata.banned_ip);
-          }
+  // Capture PayPal order after user approves
+  if (req.url === '/capture-unban-order' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      const ip = getClientIP(req);
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live'
+        ? 'https://api-m.paypal.com'
+        : 'https://api-m.sandbox.paypal.com';
+
+      if (!data.orderId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'orderId required' }));
+        return;
+      }
+
+      // Get access token
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      // Capture the order
+      const captureRes = await fetch(`${paypalBase}/v2/checkout/orders/${data.orderId}/capture`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${authData.access_token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const captureData = await captureRes.json();
+
+      if (captureData.status === 'COMPLETED') {
+        // Extract IP and token from custom_id
+        const customId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id
+          || captureData.purchase_units?.[0]?.custom_id || '';
+        const [bannedIP, unbanToken] = customId.split('|');
+
+        // Unban using either the custom_id IP or the requester's IP
+        const targetIP = bannedIP || ip;
+        const banInfo = getBanInfo(targetIP);
+        if (banInfo && (!unbanToken || banInfo.unbanToken === unbanToken)) {
+          unbanIP(targetIP);
+          console.log(`[PAYPAL] Unban payment completed for ${targetIP.slice(0, 8)}***`);
+        } else {
+          // Fallback: unban the requester's IP
+          unbanIP(ip);
+          console.log(`[PAYPAL] Unban payment completed for requester ${ip.slice(0, 8)}***`);
         }
-        res.writeHead(200); res.end('ok');
-      } catch { res.writeHead(400); res.end('bad'); }
-    });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, status: 'COMPLETED' }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, status: captureData.status }));
+      }
+    } catch (e) {
+      console.error('[PAYPAL CAPTURE ERROR]', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
