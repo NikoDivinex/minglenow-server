@@ -672,6 +672,25 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Admin give coins to a user
+  if (req.url === '/admin/give-coins' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (data.ip && data.amount > 0) {
+      addCoins(data.ip, data.amount, `Admin gift: ${data.amount} coins`);
+      // Notify user if online
+      clients.forEach((d, ws) => {
+        if (d.ip === data.ip) send(ws, { type: 'coins_updated', balance: getBalance(data.ip) });
+      });
+      console.log(`[ADMIN] Gave ${data.amount} coins to ${data.ip.slice(0, 8)}***`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, balance: getBalance(data.ip) }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'IP and amount required' }));
+    }
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('MingleNow Signaling Server');
 });
