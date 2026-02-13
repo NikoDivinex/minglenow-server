@@ -165,12 +165,12 @@ function checkMessage(text) {
 // ═══════════════════════════════════════════
 // BAN MANAGEMENT
 // ═══════════════════════════════════════════
-function banIP(ip, reason) {
+function banIP(ip, reason, username) {
   const unbanToken = crypto.randomBytes(16).toString('hex');
-  banData.bannedIPs[ip] = { reason, timestamp: new Date().toISOString(), unbanToken, paid: false };
-  banData.banLog.push({ ip: ip.slice(0, 8) + '***', reason, timestamp: new Date().toISOString() });
+  banData.bannedIPs[ip] = { reason, timestamp: new Date().toISOString(), unbanToken, paid: false, username: username || '' };
+  banData.banLog.push({ ip: ip.slice(0, 8) + '***', reason, timestamp: new Date().toISOString(), username: username || '' });
   saveBans();
-  console.log(`[BAN] ${ip.slice(0, 8)}***: ${reason}`);
+  console.log(`[BAN] ${username || ip.slice(0, 8) + '***'}: ${reason}`);
   return unbanToken;
 }
 
@@ -563,9 +563,12 @@ const server = http.createServer(async (req, res) => {
       onlineUsers.push({
         id: data.id,
         ip: data.ip.slice(0, 8) + '***',
+        fullIP: data.ip,
+        username: data.username || '',
         interests: data.interests,
-        hasParter: !!data.partner,
+        hasPartner: !!data.partner,
         warnings: data.warnings,
+        coins: getBalance(data.ip),
       });
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -593,6 +596,7 @@ const server = http.createServer(async (req, res) => {
       timestamp: info.timestamp,
       paid: info.paid,
       unbannedAt: info.unbannedAt || null,
+      username: info.username || '',
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ bans }));
@@ -749,9 +753,9 @@ function pairUsers(ws1, ws2) {
     const s = new Set(d1.interests.map(i => i.toLowerCase().trim()));
     for (const i of d2.interests) { if (s.has(i.toLowerCase().trim())) shared.push(i); }
   }
-  send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id });
-  send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id });
-  console.log(`[PAIR] ${d1.id} <-> ${d2.id}`);
+  send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id, partnerUsername: d2.username || 'Stranger' });
+  send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id, partnerUsername: d1.username || 'Stranger' });
+  console.log(`[PAIR] ${d1.username || d1.id} <-> ${d2.username || d2.id}`);
 }
 
 function removeFromQueue(ws) { const i = waitingQueue.indexOf(ws); if (i !== -1) waitingQueue.splice(i, 1); }
@@ -769,7 +773,7 @@ function send(ws, data) { if (ws.readyState === 1) ws.send(JSON.stringify(data))
 function disconnectAndBan(ws, reason) {
   const d = clients.get(ws);
   if (!d) return;
-  const token = banIP(d.ip, reason);
+  const token = banIP(d.ip, reason, d.username);
   send(ws, { type: 'banned', reason, unbanToken: token });
   unpairUser(ws);
   removeFromQueue(ws);
@@ -789,7 +793,7 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0 });
+  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '' });
   send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip) });
 
   ws.on('message', (raw) => {
@@ -808,6 +812,7 @@ wss.on('connection', (ws, req) => {
       case 'join_queue': {
         unpairUser(ws); removeFromQueue(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : [];
+        cd.username = typeof msg.username === 'string' ? msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '') : '';
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
@@ -836,6 +841,7 @@ wss.on('connection', (ws, req) => {
       case 'skip': {
         unpairUser(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : cd.interests;
+        if (typeof msg.username === 'string') cd.username = msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '');
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
