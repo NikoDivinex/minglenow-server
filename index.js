@@ -11,6 +11,33 @@ const REPORTS_TO_AUTO_BAN = 3;
 const BAN_DATA_FILE = path.join(__dirname, 'bans.json');
 const UNBAN_PRICE_CENTS = 799; // $7.99
 
+// ─── Admin Config ───
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'MingleNow2026!';
+const adminTokens = new Set();
+
+function generateAdminToken() {
+  const token = crypto.randomBytes(32).toString('hex');
+  adminTokens.add(token);
+  // Expire token after 24 hours
+  setTimeout(() => adminTokens.delete(token), 24 * 60 * 60 * 1000);
+  return token;
+}
+
+function isValidAdmin(req) {
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ')) return false;
+  return adminTokens.has(auth.split('Bearer ')[1]);
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve({}); } });
+  });
+}
+
 // ═══════════════════════════════════════════
 // BAN PERSISTENCE
 // ═══════════════════════════════════════════
@@ -139,7 +166,7 @@ function getClientIP(req) {
 // ═══════════════════════════════════════════
 // HTTP SERVER
 // ═══════════════════════════════════════════
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -169,45 +196,41 @@ const server = http.createServer((req, res) => {
 
   // Create Stripe checkout for unban
   if (req.url === '/create-unban-session' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const ip = getClientIP(req);
-        const banInfo = getBanInfo(ip);
-        if (!banInfo || banInfo.paid) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Not banned' }));
-          return;
-        }
-        if (process.env.STRIPE_SECRET_KEY) {
-          const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-          const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-              price_data: {
-                currency: 'usd',
-                product_data: { name: 'MingleNow Unban', description: 'Remove your ban and regain access' },
-                unit_amount: UNBAN_PRICE_CENTS,
-              },
-              quantity: 1,
-            }],
-            mode: 'payment',
-            success_url: `${req.headers.origin || 'https://your-site.vercel.app'}?unbanned=true`,
-            cancel_url: `${req.headers.origin || 'https://your-site.vercel.app'}?unbanned=false`,
-            metadata: { banned_ip: ip, unban_token: banInfo.unbanToken },
-          });
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ url: session.url }));
-        } else {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Stripe not configured', message: 'Set STRIPE_SECRET_KEY on Railway' }));
-        }
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+    try {
+      const ip = getClientIP(req);
+      const banInfo = getBanInfo(ip);
+      if (!banInfo || banInfo.paid) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not banned' }));
+        return;
       }
-    });
+      if (process.env.STRIPE_SECRET_KEY) {
+        const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ['card'],
+          line_items: [{
+            price_data: {
+              currency: 'usd',
+              product_data: { name: 'MingleNow Unban', description: 'Remove your ban and regain access' },
+              unit_amount: UNBAN_PRICE_CENTS,
+            },
+            quantity: 1,
+          }],
+          mode: 'payment',
+          success_url: `${req.headers.origin || 'https://uminglenow.com'}?unbanned=true`,
+          cancel_url: `${req.headers.origin || 'https://uminglenow.com'}?unbanned=false`,
+          metadata: { banned_ip: ip, unban_token: banInfo.unbanToken },
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: session.url }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Stripe not configured', message: 'Set STRIPE_SECRET_KEY on Railway' }));
+      }
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
@@ -228,6 +251,158 @@ const server = http.createServer((req, res) => {
         res.writeHead(200); res.end('ok');
       } catch { res.writeHead(400); res.end('bad'); }
     });
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  // ADMIN API
+  // ═══════════════════════════════════════════
+
+  // Admin login
+  if (req.url === '/admin/login' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (data.username === ADMIN_USER && data.password === ADMIN_PASS) {
+      const token = generateAdminToken();
+      console.log(`[ADMIN] Login successful`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, token }));
+    } else {
+      console.log(`[ADMIN] Failed login attempt`);
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Invalid credentials' }));
+    }
+    return;
+  }
+
+  // Admin verify token
+  if (req.url === '/admin/verify') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ valid: isValidAdmin(req) }));
+    return;
+  }
+
+  // ── All routes below require admin auth ──
+  if (req.url?.startsWith('/admin/') && req.url !== '/admin/login' && req.url !== '/admin/verify') {
+    if (!isValidAdmin(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+  }
+
+  // Admin dashboard stats
+  if (req.url === '/admin/stats') {
+    const activeBans = Object.entries(banData.bannedIPs).filter(([_, v]) => !v.paid);
+    const paidUnbans = Object.entries(banData.bannedIPs).filter(([_, v]) => v.paid);
+    const onlineUsers = [];
+    clients.forEach((data, ws) => {
+      onlineUsers.push({
+        id: data.id,
+        ip: data.ip.slice(0, 8) + '***',
+        interests: data.interests,
+        hasParter: !!data.partner,
+        warnings: data.warnings,
+      });
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      online: clients.size,
+      waiting: waitingQueue.length,
+      connected: connectedPairs.size,
+      totalBans: activeBans.length,
+      totalUnbans: paidUnbans.length,
+      revenue: paidUnbans.length * 7.99,
+      recentBans: banData.banLog.slice(-50).reverse(),
+      onlineUsers,
+    }));
+    return;
+  }
+
+  // Admin get all bans
+  if (req.url === '/admin/bans') {
+    const bans = Object.entries(banData.bannedIPs).map(([ip, info]) => ({
+      ip: ip.slice(0, 8) + '***',
+      fullIP: ip,
+      reason: info.reason,
+      timestamp: info.timestamp,
+      paid: info.paid,
+      unbannedAt: info.unbannedAt || null,
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ bans }));
+    return;
+  }
+
+  // Admin manually ban an IP
+  if (req.url === '/admin/ban' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (data.ip) {
+      banIP(data.ip, data.reason || 'Banned by admin');
+      // Kick them if online
+      clients.forEach((d, ws) => {
+        if (d.ip === data.ip) {
+          send(ws, { type: 'banned', reason: data.reason || 'Banned by admin' });
+          unpairUser(ws);
+          removeFromQueue(ws);
+          setTimeout(() => ws.close(), 500);
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'IP required' }));
+    }
+    return;
+  }
+
+  // Admin manually unban an IP
+  if (req.url === '/admin/unban' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (data.ip) {
+      unbanIP(data.ip);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'IP required' }));
+    }
+    return;
+  }
+
+  // Admin kick a user by ID
+  if (req.url === '/admin/kick' && req.method === 'POST') {
+    const data = await readBody(req);
+    let kicked = false;
+    clients.forEach((d, ws) => {
+      if (d.id === data.userId) {
+        send(ws, { type: 'partner_disconnected' });
+        unpairUser(ws);
+        removeFromQueue(ws);
+        ws.close();
+        kicked = true;
+      }
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: kicked }));
+    return;
+  }
+
+  // Admin broadcast message to all users
+  if (req.url === '/admin/broadcast' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (data.message) {
+      let count = 0;
+      clients.forEach((d, ws) => {
+        send(ws, { type: 'chat_message', text: `📢 ADMIN: ${data.message}`, from: 'system' });
+        count++;
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, sent: count }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Message required' }));
+    }
     return;
   }
 
