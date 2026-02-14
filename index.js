@@ -50,7 +50,6 @@ function isUsernameTakenByAccount(username, excludeGoogleId) {
 function createOrUpdateAccount(googleId, data) {
   const existing = accountsData.accounts[googleId];
   if (existing && data.username && data.username.toLowerCase() !== existing.username.toLowerCase()) {
-    // Release old username
     delete accountsData.usernameToId[existing.username.toLowerCase()];
   }
   accountsData.accounts[googleId] = {
@@ -58,6 +57,8 @@ function createOrUpdateAccount(googleId, data) {
     email: data.email || existing?.email || '',
     gender: data.gender || existing?.gender || '',
     country: data.country || existing?.country || '',
+    bio: data.bio !== undefined ? data.bio : (existing?.bio || ''),
+    lastUsernameChange: data.lastUsernameChange || existing?.lastUsernameChange || null,
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -718,6 +719,160 @@ const server = http.createServer(async (req, res) => {
     const taken = isUsernameTakenByAccount(name, gid);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ available: !taken }));
+    return;
+  }
+
+  // Update profile (bio, gender, country — free)
+  if (req.url === '/auth/update-profile' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'googleId required' })); return; }
+    const acc = getAccount(data.googleId);
+    if (!acc) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account not found' })); return; }
+
+    // Update bio, gender, country (keep existing username)
+    createOrUpdateAccount(data.googleId, {
+      username: acc.username,
+      email: acc.email,
+      bio: typeof data.bio === 'string' ? data.bio.slice(0, 200) : acc.bio,
+      gender: data.gender || acc.gender,
+      country: data.country || acc.country,
+      lastUsernameChange: acc.lastUsernameChange,
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  // Create PayPal order for username change ($2.99)
+  if (req.url === '/auth/change-username-order' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      if (!data.googleId || !data.newUsername) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'googleId and newUsername required' }));
+        return;
+      }
+
+      const acc = getAccount(data.googleId);
+      if (!acc) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account not found' })); return; }
+
+      // Check 30-day cooldown
+      if (acc.lastUsernameChange) {
+        const daysSince = (Date.now() - new Date(acc.lastUsernameChange).getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSince < 30) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Wait ${Math.ceil(30 - daysSince)} more days before changing again` }));
+          return;
+        }
+      }
+
+      const newName = data.newUsername.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '');
+      if (newName.length < 2) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Username too short' })); return; }
+
+      if (isUsernameTakenByAccount(newName, data.googleId)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Username is already taken' }));
+        return;
+      }
+
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+
+      if (!clientId || !clientSecret) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'PayPal not configured' }));
+        return;
+      }
+
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      const orderRes = await fetch(`${paypalBase}/v2/checkout/orders`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${authData.access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          intent: 'CAPTURE',
+          purchase_units: [{ amount: { currency_code: 'USD', value: '2.99' }, description: 'MingleNow Username Change', custom_id: `uname|${data.googleId}|${newName}` }],
+        }),
+      });
+      const orderData = await orderRes.json();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ orderId: orderData.id }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Capture username change payment
+  if (req.url === '/auth/capture-username-change' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      const clientId = process.env.PAYPAL_CLIENT_ID;
+      const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+      const paypalBase = process.env.PAYPAL_MODE === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+
+      const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=client_credentials',
+      });
+      const authData = await authRes.json();
+
+      const captureRes = await fetch(`${paypalBase}/v2/checkout/orders/${data.orderId}/capture`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${authData.access_token}`, 'Content-Type': 'application/json' },
+      });
+      const captureData = await captureRes.json();
+
+      if (captureData.status === 'COMPLETED') {
+        const customId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id || '';
+        const [, googleId, newName] = customId.split('|');
+        const gid = googleId || data.googleId;
+        const username = newName || data.newUsername;
+
+        if (gid && username) {
+          // Final check: username still available
+          if (isUsernameTakenByAccount(username, gid)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'Username was taken while processing payment. Contact support for a refund.' }));
+            return;
+          }
+
+          const acc = getAccount(gid);
+          createOrUpdateAccount(gid, {
+            username,
+            email: acc?.email || '',
+            bio: acc?.bio || '',
+            gender: acc?.gender || '',
+            country: acc?.country || '',
+            lastUsernameChange: new Date().toISOString(),
+          });
+
+          coinsData.totalRevenue = (coinsData.totalRevenue || 0) + 2.99;
+          saveCoins();
+          console.log(`[USERNAME] ${gid.slice(0, 8)}... changed to "${username}" ($2.99)`);
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, username }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Missing data' }));
+        }
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Payment not completed' }));
+      }
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
