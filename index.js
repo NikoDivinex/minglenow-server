@@ -388,18 +388,46 @@ function checkMessage(text) {
 // ═══════════════════════════════════════════
 // BAN MANAGEMENT
 // ═══════════════════════════════════════════
-function banIP(ip, reason, username) {
+function banIP(ip, reason, username, googleId) {
   const unbanToken = crypto.randomBytes(16).toString('hex');
-  banData.bannedIPs[ip] = { reason, timestamp: new Date().toISOString(), unbanToken, paid: false, username: username || '' };
-  banData.banLog.push({ ip: ip.slice(0, 8) + '***', reason, timestamp: new Date().toISOString(), username: username || '' });
+  banData.bannedIPs[ip] = { reason, timestamp: new Date().toISOString(), unbanToken, paid: false, username: username || '', googleId: googleId || '' };
+  banData.banLog.push({ ip: ip.slice(0, 8) + '***', reason, timestamp: new Date().toISOString(), username: username || '', googleId: googleId || '' });
+  // Also ban the Google account if present
+  if (googleId) banGoogleAccount(googleId, reason, username);
   saveBans();
-  console.log(`[BAN] ${username || ip.slice(0, 8) + '***'}: ${reason}`);
+  console.log(`[BAN] ${username || ip.slice(0, 8) + '***'}: ${reason}${googleId ? ' (Google: ' + googleId.slice(0, 8) + '...)' : ''}`);
   return unbanToken;
+}
+
+function banGoogleAccount(googleId, reason, username) {
+  if (!banData.bannedGoogleIds) banData.bannedGoogleIds = {};
+  banData.bannedGoogleIds[googleId] = { reason, timestamp: new Date().toISOString(), username: username || '', paid: false };
+  saveBans();
 }
 
 function isIPBanned(ip) {
   const ban = banData.bannedIPs[ip];
   return ban && !ban.paid;
+}
+
+function isGoogleBanned(googleId) {
+  if (!googleId || !banData.bannedGoogleIds) return false;
+  const ban = banData.bannedGoogleIds[googleId];
+  return ban && !ban.paid;
+}
+
+function isUserBanned(ip, googleId) {
+  return isIPBanned(ip) || isGoogleBanned(googleId);
+}
+
+function unbanGoogleAccount(googleId) {
+  if (banData.bannedGoogleIds && banData.bannedGoogleIds[googleId]) {
+    banData.bannedGoogleIds[googleId].paid = true;
+    banData.bannedGoogleIds[googleId].unbannedAt = new Date().toISOString();
+    saveBans();
+    return true;
+  }
+  return false;
 }
 
 function getBanInfo(ip) { return banData.bannedIPs[ip] || null; }
@@ -1071,17 +1099,33 @@ const server = http.createServer(async (req, res) => {
     const paidUnbans = Object.entries(banData.bannedIPs).filter(([_, v]) => v.paid);
     const onlineUsers = [];
     clients.forEach((data, ws) => {
+      const ck = getCoinKey(data);
       onlineUsers.push({
         id: data.id,
         ip: data.ip.slice(0, 8) + '***',
         fullIP: data.ip,
         username: data.username || '',
+        signedIn: !!data.googleId,
+        googleId: data.googleId || null,
+        coinKey: ck,
         interests: data.interests,
         hasPartner: !!data.partner,
         warnings: data.warnings,
-        coins: getBalance(getCoinKey(data)),
+        coins: getBalance(ck),
       });
     });
+
+    // Also list all registered accounts
+    const registeredAccounts = Object.entries(accountsData.accounts).map(([gid, acc]) => ({
+      googleId: gid,
+      username: acc.username,
+      email: acc.email,
+      gender: acc.gender,
+      country: acc.country,
+      coins: getBalance(`g:${gid}`),
+      createdAt: acc.createdAt,
+    }));
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       online: clients.size,
@@ -1092,15 +1136,18 @@ const server = http.createServer(async (req, res) => {
       revenue: paidUnbans.length * 7.99 + (coinsData.totalRevenue || 0),
       coinRevenue: coinsData.totalRevenue || 0,
       totalGifts: coinsData.totalGifts || 0,
+      totalAccounts: Object.keys(accountsData.accounts).length,
       recentBans: banData.banLog.slice(-50).reverse(),
       onlineUsers,
+      registeredAccounts,
     }));
     return;
   }
 
   // Admin get all bans
   if (req.url === '/admin/bans') {
-    const bans = Object.entries(banData.bannedIPs).map(([ip, info]) => ({
+    const ipBans = Object.entries(banData.bannedIPs).map(([ip, info]) => ({
+      type: 'ip',
       ip: ip.slice(0, 8) + '***',
       fullIP: ip,
       reason: info.reason,
@@ -1108,46 +1155,88 @@ const server = http.createServer(async (req, res) => {
       paid: info.paid,
       unbannedAt: info.unbannedAt || null,
       username: info.username || '',
+      googleId: info.googleId || '',
+    }));
+    const googleBans = Object.entries(banData.bannedGoogleIds || {}).map(([gid, info]) => ({
+      type: 'google',
+      googleId: gid,
+      reason: info.reason,
+      timestamp: info.timestamp,
+      paid: info.paid,
+      unbannedAt: info.unbannedAt || null,
+      username: info.username || '',
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ bans }));
+    res.end(JSON.stringify({ bans: ipBans, googleBans }));
     return;
   }
 
-  // Admin manually ban an IP
+  // Admin manually ban — supports IP, googleId, or username
   if (req.url === '/admin/ban' && req.method === 'POST') {
     const data = await readBody(req);
-    if (data.ip) {
-      banIP(data.ip, data.reason || 'Banned by admin');
-      // Kick them if online
+    const reason = data.reason || 'Banned by admin';
+    let banned = false;
+
+    // Ban by googleId (Google account ban)
+    if (data.googleId) {
+      banGoogleAccount(data.googleId, reason, data.username || '');
+      // Also ban their IP if they're online
       clients.forEach((d, ws) => {
-        if (d.ip === data.ip) {
-          send(ws, { type: 'banned', reason: data.reason || 'Banned by admin' });
-          unpairUser(ws);
-          removeFromQueue(ws);
+        if (d.googleId === data.googleId) {
+          banIP(d.ip, reason, d.username, d.googleId);
+          send(ws, { type: 'banned', reason });
+          unpairUser(ws); removeFromQueue(ws);
           setTimeout(() => ws.close(), 500);
         }
       });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true }));
-    } else {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'IP required' }));
+      banned = true;
     }
+    // Ban by username (look up account)
+    else if (data.username) {
+      const acc = getAccountByUsername(data.username);
+      if (acc) {
+        banGoogleAccount(acc.googleId, reason, data.username);
+        clients.forEach((d, ws) => {
+          if (d.googleId === acc.googleId || d.username === data.username) {
+            banIP(d.ip, reason, d.username, d.googleId);
+            send(ws, { type: 'banned', reason });
+            unpairUser(ws); removeFromQueue(ws);
+            setTimeout(() => ws.close(), 500);
+          }
+        });
+        banned = true;
+      }
+    }
+    // Ban by IP (for strangers / non-signed-in users)
+    if (data.ip) {
+      banIP(data.ip, reason);
+      clients.forEach((d, ws) => {
+        if (d.ip === data.ip) {
+          send(ws, { type: 'banned', reason });
+          unpairUser(ws); removeFromQueue(ws);
+          setTimeout(() => ws.close(), 500);
+        }
+      });
+      banned = true;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: banned }));
     return;
   }
 
-  // Admin manually unban an IP
+  // Admin manually unban — supports IP and googleId
   if (req.url === '/admin/unban' && req.method === 'POST') {
     const data = await readBody(req);
-    if (data.ip) {
-      unbanIP(data.ip);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true }));
-    } else {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'IP required' }));
+    if (data.ip) unbanIP(data.ip);
+    if (data.googleId) unbanGoogleAccount(data.googleId);
+    // Also unban by username lookup
+    if (data.username) {
+      const acc = getAccountByUsername(data.username);
+      if (acc) unbanGoogleAccount(acc.googleId);
     }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
     return;
   }
 
@@ -1190,18 +1279,41 @@ const server = http.createServer(async (req, res) => {
   // Admin give coins to a user
   if (req.url === '/admin/give-coins' && req.method === 'POST') {
     const data = await readBody(req);
-    if (data.ip && data.amount > 0) {
-      addCoins(data.ip, data.amount, `Admin gift: ${data.amount} coins`);
+    let coinKey = null;
+    let label = '';
+
+    // Resolve coin key from various inputs
+    if (data.coinKey) {
+      coinKey = data.coinKey;
+      label = coinKey;
+    } else if (data.username) {
+      // Look up by username - check accounts first
+      const acc = getAccountByUsername(data.username);
+      if (acc) {
+        coinKey = `g:${acc.googleId}`;
+        label = data.username;
+      } else {
+        // Fall back to IP-based username lookup
+        const ipForUser = coinsData.usernames ? Object.entries(coinsData.usernames).find(([_, name]) => name.toLowerCase() === data.username.toLowerCase()) : null;
+        if (ipForUser) { coinKey = ipForUser[0]; label = data.username; }
+      }
+    } else if (data.ip) {
+      coinKey = data.ip;
+      label = data.ip.slice(0, 8) + '***';
+    }
+
+    if (coinKey && data.amount > 0) {
+      addCoins(coinKey, data.amount, `Admin gift: ${data.amount} coins`);
       // Notify user if online
       clients.forEach((d, ws) => {
-        if (d.ip === data.ip) send(ws, { type: 'coins_updated', balance: getBalance(data.ip) });
+        if (getCoinKey(d) === coinKey) send(ws, { type: 'coins_updated', balance: getBalance(coinKey) });
       });
-      console.log(`[ADMIN] Gave ${data.amount} coins to ${data.ip.slice(0, 8)}***`);
+      console.log(`[ADMIN] Gave ${data.amount} coins to ${label}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, balance: getBalance(data.ip) }));
+      res.end(JSON.stringify({ success: true, balance: getBalance(coinKey) }));
     } else {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'IP and amount required' }));
+      res.end(JSON.stringify({ error: 'Valid target and amount required' }));
     }
     return;
   }
@@ -1305,7 +1417,7 @@ function send(ws, data) { if (ws.readyState === 1) ws.send(JSON.stringify(data))
 function disconnectAndBan(ws, reason) {
   const d = clients.get(ws);
   if (!d) return;
-  const token = banIP(d.ip, reason, d.username);
+  const token = banIP(d.ip, reason, d.username, d.googleId);
   send(ws, { type: 'banned', reason, unbanToken: token });
   unpairUser(ws);
   removeFromQueue(ws);
@@ -1334,9 +1446,10 @@ wss.on('connection', (ws, req) => {
     const cd = clients.get(ws);
     if (!cd) return;
 
-    if (isIPBanned(cd.ip)) {
+    if (isUserBanned(cd.ip, cd.googleId)) {
       const info = getBanInfo(cd.ip);
-      send(ws, { type: 'banned', reason: info.reason, unbanToken: info.unbanToken });
+      const reason = info?.reason || (banData.bannedGoogleIds?.[cd.googleId]?.reason) || 'Banned';
+      send(ws, { type: 'banned', reason, unbanToken: info?.unbanToken || '' });
       ws.close(); return;
     }
 
