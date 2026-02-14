@@ -493,12 +493,18 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Check ban
-  if (req.url === '/check-ban') {
+  if (req.url?.startsWith('/check-ban')) {
     const ip = getClientIP(req);
-    const banned = isIPBanned(ip);
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const googleId = params.get('googleId') || '';
+    const ipBanned = isIPBanned(ip);
+    const googleBanned = isGoogleBanned(googleId);
+    const banned = ipBanned || googleBanned;
     const info = getBanInfo(ip);
+    const googleInfo = banData.bannedGoogleIds?.[googleId];
+    const reason = ipBanned ? info?.reason : googleInfo?.reason || null;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ banned, reason: banned ? info.reason : null, unbanToken: banned ? info.unbanToken : null }));
+    res.end(JSON.stringify({ banned, reason: banned ? reason : null, ipBanned, googleBanned }));
     return;
   }
 
@@ -506,12 +512,19 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/create-unban-order' && req.method === 'POST') {
     try {
       const ip = getClientIP(req);
-      const banInfo = getBanInfo(ip);
-      if (!banInfo || banInfo.paid) {
+      const data = await readBody(req);
+      const googleId = data.googleId || '';
+      const ipBanned = isIPBanned(ip);
+      const googleBanned = isGoogleBanned(googleId);
+
+      if (!ipBanned && !googleBanned) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not banned' }));
         return;
       }
+
+      const banInfo = getBanInfo(ip);
+      const unbanToken = banInfo?.unbanToken || '';
 
       const clientId = process.env.PAYPAL_CLIENT_ID;
       const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
@@ -525,7 +538,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Get access token
       const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
         method: 'POST',
         headers: {
@@ -536,7 +548,6 @@ const server = http.createServer(async (req, res) => {
       });
       const authData = await authRes.json();
 
-      // Create order
       const orderRes = await fetch(`${paypalBase}/v2/checkout/orders`, {
         method: 'POST',
         headers: {
@@ -548,7 +559,7 @@ const server = http.createServer(async (req, res) => {
           purchase_units: [{
             amount: { currency_code: 'USD', value: '7.99' },
             description: 'MingleNow Account Unban',
-            custom_id: `${ip}|${banInfo.unbanToken}`,
+            custom_id: `${ip}|${unbanToken}|${googleId}`,
           }],
         }),
       });
@@ -581,7 +592,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Get access token
       const authRes = await fetch(`${paypalBase}/v1/oauth2/token`, {
         method: 'POST',
         headers: {
@@ -592,7 +602,6 @@ const server = http.createServer(async (req, res) => {
       });
       const authData = await authRes.json();
 
-      // Capture the order
       const captureRes = await fetch(`${paypalBase}/v2/checkout/orders/${data.orderId}/capture`, {
         method: 'POST',
         headers: {
@@ -603,23 +612,28 @@ const server = http.createServer(async (req, res) => {
       const captureData = await captureRes.json();
 
       if (captureData.status === 'COMPLETED') {
-        // Extract IP and token from custom_id
         const customId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id
           || captureData.purchase_units?.[0]?.custom_id || '';
-        const [bannedIP, unbanToken] = customId.split('|');
+        const parts = customId.split('|');
+        const bannedIP = parts[0] || ip;
+        const unbanToken = parts[1] || '';
+        const googleId = parts[2] || '';
 
-        // Unban using either the custom_id IP or the requester's IP
-        const targetIP = bannedIP || ip;
-        const banInfo = getBanInfo(targetIP);
+        // Unban IP
+        const banInfo = getBanInfo(bannedIP);
         if (banInfo && (!unbanToken || banInfo.unbanToken === unbanToken)) {
-          unbanIP(targetIP);
-          console.log(`[PAYPAL] Unban payment completed for ${targetIP.slice(0, 8)}***`);
+          unbanIP(bannedIP);
         } else {
-          // Fallback: unban the requester's IP
           unbanIP(ip);
-          console.log(`[PAYPAL] Unban payment completed for requester ${ip.slice(0, 8)}***`);
         }
 
+        // Also unban Google account if present
+        if (googleId) {
+          unbanGoogleAccount(googleId);
+          console.log(`[PAYPAL] Unban payment completed for Google account ${googleId.slice(0, 8)}...`);
+        }
+
+        console.log(`[PAYPAL] Unban payment completed for IP ${bannedIP.slice(0, 8)}***`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, status: 'COMPLETED' }));
       } else {
