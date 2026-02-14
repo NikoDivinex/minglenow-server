@@ -33,10 +33,12 @@ const COIN_PACKAGES = {
 };
 
 // ─── Coins Persistence ───
-let coinsData = { balances: {}, transactions: [], totalRevenue: 0, totalGifts: 0, perks: {}, recentPartners: {} };
+let coinsData = { balances: {}, transactions: [], totalRevenue: 0, totalGifts: 0, perks: {}, recentPartners: {}, giftsReceived: {}, usernames: {} };
 // balances: { "ip": coinCount }
 // perks: { "ip": { nameColor: "gold", bubbleTheme: "neon", entrance: "fire", region: "us" } }
 // recentPartners: { "ip": ["partnerId1","partnerId2"...] }
+// giftsReceived: { "ip": totalCoinsReceived }
+// usernames: { "ip": "lastKnownUsername" }
 
 // ─── Perks Shop ───
 const PERKS = {
@@ -129,6 +131,30 @@ function addRecentPartner(ip, partnerId, partnerIp) {
   list.unshift(entry);
   if (list.length > 10) list.length = 10;
   saveCoins();
+}
+
+function trackGiftReceived(ip, amount) {
+  if (!coinsData.giftsReceived) coinsData.giftsReceived = {};
+  coinsData.giftsReceived[ip] = (coinsData.giftsReceived[ip] || 0) + amount;
+  saveCoins();
+}
+
+function setUsername(ip, username) {
+  if (!coinsData.usernames) coinsData.usernames = {};
+  if (username) coinsData.usernames[ip] = username;
+}
+
+function getLeaderboard(limit = 10) {
+  if (!coinsData.giftsReceived) return [];
+  const entries = Object.entries(coinsData.giftsReceived)
+    .map(([ip, total]) => ({
+      username: (coinsData.usernames || {})[ip] || 'Anonymous',
+      coinsReceived: total,
+      nameColor: (coinsData.perks || {})[ip]?.nameColor || null,
+    }))
+    .sort((a, b) => b.coinsReceived - a.coinsReceived)
+    .slice(0, limit);
+  return entries;
 }
 
 // ─── Admin Config ───
@@ -443,6 +469,15 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
     }
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  // PUBLIC LEADERBOARD (no auth needed)
+  // ═══════════════════════════════════════════
+  if (req.url === '/leaderboard') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ leaderboard: getLeaderboard(15) }));
     return;
   }
 
@@ -960,6 +995,7 @@ wss.on('connection', (ws, req) => {
         unpairUser(ws); removeFromQueue(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : [];
         cd.username = typeof msg.username === 'string' ? msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '') : '';
+        if (cd.username) setUsername(cd.ip, cd.username);
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
@@ -988,7 +1024,7 @@ wss.on('connection', (ws, req) => {
       case 'skip': {
         unpairUser(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : cd.interests;
-        if (typeof msg.username === 'string') cd.username = msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '');
+        if (typeof msg.username === 'string') { cd.username = msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, ''); if (cd.username) setUsername(cd.ip, cd.username); }
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
@@ -1021,13 +1057,21 @@ wss.on('connection', (ws, req) => {
             send(ws, { type: 'gift_error', message: 'Not enough M Coins!' });
             break;
           }
+          // Credit coins to the receiver
+          const pd = clients.get(cd.partner);
+          if (pd) {
+            addCoins(pd.ip, gift.cost, `Gift from ${cd.username || 'stranger'}: ${gift.name}`);
+            trackGiftReceived(pd.ip, gift.cost);
+            // Notify receiver of updated balance
+            send(cd.partner, { type: 'coins_updated', balance: getBalance(pd.ip) });
+          }
           coinsData.totalGifts = (coinsData.totalGifts || 0) + 1;
           saveCoins();
-          // Send to both sender and receiver
-          const giftMsg = { type: 'gift_received', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, from: 'stranger' };
+          // Send animation to both
+          const giftMsg = { type: 'gift_received', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, from: cd.username || 'stranger' };
           send(cd.partner, giftMsg);
           send(ws, { type: 'gift_sent', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, balance: getBalance(cd.ip) });
-          console.log(`[GIFT] ${cd.id} sent ${gift.name} (${gift.cost} coins)`);
+          console.log(`[GIFT] ${cd.username || cd.id} sent ${gift.name} (${gift.cost} coins) to ${pd?.username || 'stranger'}`);
         }
         break;
       }
