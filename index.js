@@ -1360,6 +1360,7 @@ function findBestMatch(ws) {
   if (!d) return null;
   const myPerks = getUserPerks(getCoinKey(d));
   const myRegion = myPerks.region || 'any';
+  const myMode = d.mode || 'video';
 
   let best = null, bestScore = -1;
   for (let i = 0; i < waitingQueue.length; i++) {
@@ -1367,9 +1368,10 @@ function findBestMatch(ws) {
     if (c === ws || c.readyState !== 1) continue;
     const cd = clients.get(c);
     if (!cd || cd.partner) continue;
+    // Mode filter: only match same mode (video↔video, text↔text)
+    if ((cd.mode || 'video') !== myMode) continue;
     const theirPerks = getUserPerks(getCoinKey(cd));
     const theirRegion = theirPerks.region || 'any';
-    // Region filter: skip if either has a region set and they don't match
     if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
     if (myRegion !== 'any' && theirRegion === 'any') { /* ok, they accept anyone */ }
     if (myRegion === 'any' && theirRegion !== 'any') { /* ok, we accept anyone */ }
@@ -1382,6 +1384,7 @@ function findBestMatch(ws) {
       if (c === ws || c.readyState !== 1) continue;
       const cd = clients.get(c);
       if (!cd || cd.partner) continue;
+      if ((cd.mode || 'video') !== myMode) continue;
       const theirPerks = getUserPerks(getCoinKey(cd));
       const theirRegion = theirPerks.region || 'any';
       if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
@@ -1451,7 +1454,7 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '', googleId: null });
+  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '', googleId: null, mode: 'video' });
   send(ws, { type: 'welcome', id, online: clients.size });
 
   ws.on('message', (raw) => {
@@ -1473,6 +1476,7 @@ wss.on('connection', (ws, req) => {
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : [];
         cd.username = typeof msg.username === 'string' ? msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '') : '';
         if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.mode === 'video' || msg.mode === 'text') cd.mode = msg.mode;
         if (cd.username) setUsername(cd.ip, cd.username);
         // Send coins/perks now that googleId is known
         const ck = getCoinKey(cd);
@@ -1508,6 +1512,7 @@ wss.on('connection', (ws, req) => {
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : cd.interests;
         if (typeof msg.username === 'string') { cd.username = msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, ''); if (cd.username) setUsername(cd.ip, cd.username); }
         if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.mode === 'video' || msg.mode === 'text') cd.mode = msg.mode;
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
