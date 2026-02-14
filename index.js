@@ -186,7 +186,22 @@ function saveCoins() {
   catch (e) { console.error('[COINS] Save error:', e.message); }
 }
 
-function getBalance(ip) { return coinsData.balances[ip] || 0; }
+function getBalance(key) { return coinsData.balances[key] || 0; }
+
+// Get the coin/perk storage key for a client - googleId if signed in, ip if guest
+function getCoinKey(clientData) {
+  return clientData.googleId ? `g:${clientData.googleId}` : clientData.ip;
+}
+
+// Get coin key from HTTP request (checks googleId query param or falls back to IP)
+function getKeyFromReq(req) {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const gid = url.searchParams.get('googleId');
+    if (gid) return `g:${gid}`;
+  } catch (e) {}
+  return getClientIP(req);
+}
 
 function addCoins(ip, amount, reason) {
   coinsData.balances[ip] = (coinsData.balances[ip] || 0) + amount;
@@ -816,10 +831,10 @@ const server = http.createServer(async (req, res) => {
   // ═══════════════════════════════════════════
 
   // Get coin balance
-  if (req.url === '/coins/balance') {
-    const ip = getClientIP(req);
+  if (req.url?.startsWith('/coins/balance')) {
+    const key = getKeyFromReq(req);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ balance: getBalance(ip) }));
+    res.end(JSON.stringify({ balance: getBalance(key) }));
     return;
   }
 
@@ -834,7 +849,15 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/coins/create-order' && req.method === 'POST') {
     try {
       const data = await readBody(req);
-      const ip = getClientIP(req);
+
+      // Require Google sign-in to purchase coins
+      if (!data.googleId) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Sign in with Google to purchase M Coins' }));
+        return;
+      }
+
+      const coinKey = `g:${data.googleId}`;
       const pack = COIN_PACKAGES[data.packageId];
 
       if (!pack) {
@@ -875,7 +898,7 @@ const server = http.createServer(async (req, res) => {
           purchase_units: [{
             amount: { currency_code: 'USD', value: pack.price },
             description: `MingleNow ${pack.label}`,
-            custom_id: `coins|${ip}|${data.packageId}`,
+            custom_id: `coins|${coinKey}|${data.packageId}`,
           }],
         }),
       });
@@ -893,7 +916,6 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/coins/capture-order' && req.method === 'POST') {
     try {
       const data = await readBody(req);
-      const ip = getClientIP(req);
       const clientId = process.env.PAYPAL_CLIENT_ID;
       const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
       const paypalBase = process.env.PAYPAL_MODE === 'live'
@@ -917,24 +939,23 @@ const server = http.createServer(async (req, res) => {
 
       if (captureData.status === 'COMPLETED') {
         const customId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id || '';
-        const [, buyerIP, packageId] = customId.split('|');
+        const [, coinKey, packageId] = customId.split('|');
         const pack = COIN_PACKAGES[packageId];
-        const targetIP = buyerIP || ip;
 
-        if (pack) {
-          addCoins(targetIP, pack.coins, `Purchased ${pack.label} ($${pack.price})`);
+        if (pack && coinKey) {
+          addCoins(coinKey, pack.coins, `Purchased ${pack.label} ($${pack.price})`);
           coinsData.totalRevenue = (coinsData.totalRevenue || 0) + parseFloat(pack.price);
           saveCoins();
-          console.log(`[COINS] ${targetIP.slice(0, 8)}*** bought ${pack.label}`);
+          console.log(`[COINS] ${coinKey.slice(0, 12)}*** bought ${pack.label}`);
 
           // Notify the user's websocket if they're connected
           clients.forEach((d, ws) => {
-            if (d.ip === targetIP) send(ws, { type: 'coins_updated', balance: getBalance(targetIP) });
+            if (getCoinKey(d) === coinKey) send(ws, { type: 'coins_updated', balance: getBalance(coinKey) });
           });
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, balance: getBalance(targetIP) }));
+        res.end(JSON.stringify({ success: true, balance: getBalance(coinKey) }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false }));
@@ -954,23 +975,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Get user's active perks
-  if (req.url === '/perks/mine') {
-    const ip = getClientIP(req);
+  if (req.url?.startsWith('/perks/mine')) {
+    const key = getKeyFromReq(req);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ perks: getUserPerks(ip), balance: getBalance(ip) }));
+    res.end(JSON.stringify({ perks: getUserPerks(key), balance: getBalance(key) }));
     return;
   }
 
   // Buy a perk
   if (req.url === '/perks/buy' && req.method === 'POST') {
-    const ip = getClientIP(req);
     const data = await readBody(req);
-    const { type, id } = data; // type: nameColor, bubbleTheme, entrance, region
+    const key = data.googleId ? `g:${data.googleId}` : getClientIP(req);
+    const { type, id } = data;
 
     let cost = 0;
     let valid = false;
     if (id === 'none') {
-      // Clear this perk type - free
       valid = true; cost = 0;
     } else if (type === 'nameColor' && PERKS.nameColors[id]) { cost = PERKS.nameColors[id].cost; valid = true; }
     else if (type === 'bubbleTheme' && PERKS.bubbleThemes[id]) { cost = PERKS.bubbleThemes[id].cost; valid = true; }
@@ -983,31 +1003,29 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Check if already owned (no charge for re-equipping same)
-    const current = getUserPerks(ip);
+    const current = getUserPerks(key);
     if (current[type] === id) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Already equipped', balance: getBalance(ip), perks: getUserPerks(ip) }));
+      res.end(JSON.stringify({ success: true, message: 'Already equipped', balance: getBalance(key), perks: getUserPerks(key) }));
       return;
     }
 
-    if (cost > 0 && !spendCoins(ip, cost)) {
+    if (cost > 0 && !spendCoins(key, cost)) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not enough coins', balance: getBalance(ip) }));
+      res.end(JSON.stringify({ error: 'Not enough coins', balance: getBalance(key) }));
       return;
     }
 
-    setUserPerk(ip, type, id);
+    setUserPerk(key, type, id);
 
-    // Notify user's websocket
     clients.forEach((d, ws) => {
-      if (d.ip === ip) {
-        send(ws, { type: 'perks_updated', perks: getUserPerks(ip), balance: getBalance(ip) });
+      if (getCoinKey(d) === key) {
+        send(ws, { type: 'perks_updated', perks: getUserPerks(key), balance: getBalance(key) });
       }
     });
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, balance: getBalance(ip), perks: getUserPerks(ip) }));
+    res.end(JSON.stringify({ success: true, balance: getBalance(key), perks: getUserPerks(key) }));
     return;
   }
 
@@ -1061,7 +1079,7 @@ const server = http.createServer(async (req, res) => {
         interests: data.interests,
         hasPartner: !!data.partner,
         warnings: data.warnings,
-        coins: getBalance(data.ip),
+        coins: getBalance(getCoinKey(data)),
       });
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1214,7 +1232,7 @@ function calculateMatchScore(a, b) {
 function findBestMatch(ws) {
   const d = clients.get(ws);
   if (!d) return null;
-  const myPerks = getUserPerks(d.ip);
+  const myPerks = getUserPerks(getCoinKey(d));
   const myRegion = myPerks.region || 'any';
 
   let best = null, bestScore = -1;
@@ -1223,7 +1241,7 @@ function findBestMatch(ws) {
     if (c === ws || c.readyState !== 1) continue;
     const cd = clients.get(c);
     if (!cd || cd.partner) continue;
-    const theirPerks = getUserPerks(cd.ip);
+    const theirPerks = getUserPerks(getCoinKey(cd));
     const theirRegion = theirPerks.region || 'any';
     // Region filter: skip if either has a region set and they don't match
     if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
@@ -1238,7 +1256,7 @@ function findBestMatch(ws) {
       if (c === ws || c.readyState !== 1) continue;
       const cd = clients.get(c);
       if (!cd || cd.partner) continue;
-      const theirPerks = getUserPerks(cd.ip);
+      const theirPerks = getUserPerks(getCoinKey(cd));
       const theirRegion = theirPerks.region || 'any';
       if (myRegion !== 'any' && theirRegion !== 'any' && myRegion !== theirRegion) continue;
       best = { index: i, ws: c, score: 0 }; break;
@@ -1258,8 +1276,8 @@ function pairUsers(ws1, ws2) {
     const s = new Set(d1.interests.map(i => i.toLowerCase().trim()));
     for (const i of d2.interests) { if (s.has(i.toLowerCase().trim())) shared.push(i); }
   }
-  const p1 = getUserPerks(d1.ip);
-  const p2 = getUserPerks(d2.ip);
+  const p1 = getUserPerks(getCoinKey(d1));
+  const p2 = getUserPerks(getCoinKey(d2));
   send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id,
     partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance },
     partnerSignedIn: !!d2.googleId });
@@ -1308,7 +1326,7 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '', googleId: null });
-  send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip), perks: getUserPerks(ip) });
+  send(ws, { type: 'welcome', id, online: clients.size });
 
   ws.on('message', (raw) => {
     let msg;
@@ -1329,6 +1347,10 @@ wss.on('connection', (ws, req) => {
         cd.username = typeof msg.username === 'string' ? msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '') : '';
         if (msg.googleId) cd.googleId = msg.googleId;
         if (cd.username) setUsername(cd.ip, cd.username);
+        // Send coins/perks now that googleId is known
+        const ck = getCoinKey(cd);
+        send(ws, { type: 'coins_updated', balance: getBalance(ck) });
+        send(ws, { type: 'perks_updated', perks: getUserPerks(ck), balance: getBalance(ck) });
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
@@ -1387,24 +1409,24 @@ wss.on('connection', (ws, req) => {
         if (cd.partner && typeof msg.giftId === 'string') {
           const gift = GIFTS[msg.giftId];
           if (!gift) break;
-          if (!spendCoins(cd.ip, gift.cost)) {
+          if (!spendCoins(getCoinKey(cd), gift.cost)) {
             send(ws, { type: 'gift_error', message: 'Not enough M Coins!' });
             break;
           }
           // Credit coins to the receiver
           const pd = clients.get(cd.partner);
           if (pd) {
-            addCoins(pd.ip, gift.cost, `Gift from ${cd.username || 'stranger'}: ${gift.name}`);
+            addCoins(getCoinKey(pd), gift.cost, `Gift from ${cd.username || 'stranger'}: ${gift.name}`);
             trackGiftReceived(pd.ip, gift.cost);
             // Notify receiver of updated balance
-            send(cd.partner, { type: 'coins_updated', balance: getBalance(pd.ip) });
+            send(cd.partner, { type: 'coins_updated', balance: getBalance(getCoinKey(pd)) });
           }
           coinsData.totalGifts = (coinsData.totalGifts || 0) + 1;
           saveCoins();
           // Send animation to both
           const giftMsg = { type: 'gift_received', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, from: cd.username || 'stranger' };
           send(cd.partner, giftMsg);
-          send(ws, { type: 'gift_sent', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, balance: getBalance(cd.ip) });
+          send(ws, { type: 'gift_sent', giftId: msg.giftId, emoji: gift.emoji, name: gift.name, cost: gift.cost, balance: getBalance(getCoinKey(cd)) });
           console.log(`[GIFT] ${cd.username || cd.id} sent ${gift.name} (${gift.cost} coins) to ${pd?.username || 'stranger'}`);
         }
         break;
@@ -1413,16 +1435,16 @@ wss.on('connection', (ws, req) => {
       // ─── Reconnect with last partner ───
       case 'reconnect': {
         const cost = PERKS.reconnectCost;
-        if (!spendCoins(cd.ip, cost)) {
+        if (!spendCoins(getCoinKey(cd), cost)) {
           send(ws, { type: 'gift_error', message: `Need ${cost} M Coins to reconnect!` });
           break;
         }
-        send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+        send(ws, { type: 'coins_updated', balance: getBalance(getCoinKey(cd)) });
         const recent = getRecentPartners(cd.ip);
         if (recent.length === 0) {
-          addCoins(cd.ip, cost, 'Reconnect refund - no history');
+          addCoins(getCoinKey(cd), cost, 'Reconnect refund - no history');
           send(ws, { type: 'gift_error', message: 'No recent partners to reconnect with.' });
-          send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+          send(ws, { type: 'coins_updated', balance: getBalance(getCoinKey(cd)) });
           break;
         }
         // Try to find the most recent partner who is online and not paired
@@ -1439,8 +1461,8 @@ wss.on('connection', (ws, req) => {
           if (found) break;
         }
         if (!found) {
-          addCoins(cd.ip, cost, 'Reconnect refund - partner offline');
-          send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+          addCoins(getCoinKey(cd), cost, 'Reconnect refund - partner offline');
+          send(ws, { type: 'coins_updated', balance: getBalance(getCoinKey(cd)) });
           send(ws, { type: 'gift_error', message: 'Your last partner is not available right now.' });
         }
         break;
@@ -1470,7 +1492,7 @@ wss.on('connection', (ws, req) => {
 
       // ─── Get Balance via WS ───
       case 'get_balance': {
-        send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
+        send(ws, { type: 'coins_updated', balance: getBalance(getCoinKey(cd)) });
         break;
       }
 
