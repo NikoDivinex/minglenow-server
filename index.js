@@ -10,7 +10,104 @@ const HEARTBEAT_INTERVAL = 30000;
 const REPORTS_TO_AUTO_BAN = 3;
 const BAN_DATA_FILE = path.join(__dirname, 'bans.json');
 const COINS_DATA_FILE = path.join(__dirname, 'coins.json');
+const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const UNBAN_PRICE_CENTS = 799; // $7.99
+
+// ─── Accounts Persistence ───
+let accountsData = { accounts: {}, usernameToId: {}, friends: {}, dms: {} };
+// accounts: { "google_id": { username, email, gender, country, createdAt } }
+// usernameToId: { "username_lower": "google_id" }
+// friends: { "google_id": ["friend_google_id",...] }
+// dms: { "convo_key": [{ from, text, timestamp },...] }
+
+function loadAccounts() {
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) {
+      accountsData = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+      console.log(`[ACCOUNTS] Loaded ${Object.keys(accountsData.accounts).length} accounts`);
+    }
+  } catch (e) { console.error('[ACCOUNTS] Load error:', e.message); }
+}
+
+function saveAccounts() {
+  try { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accountsData, null, 2)); }
+  catch (e) { console.error('[ACCOUNTS] Save error:', e.message); }
+}
+
+function getAccount(googleId) { return accountsData.accounts[googleId] || null; }
+
+function getAccountByUsername(username) {
+  const id = accountsData.usernameToId[username.toLowerCase()];
+  return id ? { ...accountsData.accounts[id], googleId: id } : null;
+}
+
+function isUsernameTakenByAccount(username, excludeGoogleId) {
+  const owner = accountsData.usernameToId[username.toLowerCase()];
+  if (!owner) return false;
+  return owner !== excludeGoogleId;
+}
+
+function createOrUpdateAccount(googleId, data) {
+  const existing = accountsData.accounts[googleId];
+  if (existing && data.username && data.username.toLowerCase() !== existing.username.toLowerCase()) {
+    // Release old username
+    delete accountsData.usernameToId[existing.username.toLowerCase()];
+  }
+  accountsData.accounts[googleId] = {
+    username: data.username || existing?.username || 'User',
+    email: data.email || existing?.email || '',
+    gender: data.gender || existing?.gender || '',
+    country: data.country || existing?.country || '',
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  accountsData.usernameToId[data.username.toLowerCase()] = googleId;
+  saveAccounts();
+}
+
+function getDMKey(id1, id2) { return [id1, id2].sort().join(':'); }
+
+function getDMs(id1, id2, limit = 50) {
+  const key = getDMKey(id1, id2);
+  if (!accountsData.dms) accountsData.dms = {};
+  return (accountsData.dms[key] || []).slice(-limit);
+}
+
+function saveDM(fromId, toId, text) {
+  const key = getDMKey(fromId, toId);
+  if (!accountsData.dms) accountsData.dms = {};
+  if (!accountsData.dms[key]) accountsData.dms[key] = [];
+  accountsData.dms[key].push({ from: fromId, text, timestamp: Date.now() });
+  if (accountsData.dms[key].length > 200) accountsData.dms[key] = accountsData.dms[key].slice(-200);
+  saveAccounts();
+}
+
+function getFriends(googleId) {
+  if (!accountsData.friends) accountsData.friends = {};
+  return accountsData.friends[googleId] || [];
+}
+
+function addFriend(googleId, friendGoogleId) {
+  if (!accountsData.friends) accountsData.friends = {};
+  if (!accountsData.friends[googleId]) accountsData.friends[googleId] = [];
+  if (!accountsData.friends[friendGoogleId]) accountsData.friends[friendGoogleId] = [];
+  if (!accountsData.friends[googleId].includes(friendGoogleId)) {
+    accountsData.friends[googleId].push(friendGoogleId);
+  }
+  if (!accountsData.friends[friendGoogleId].includes(googleId)) {
+    accountsData.friends[friendGoogleId].push(googleId);
+  }
+  saveAccounts();
+}
+
+function removeFriendFromList(googleId, friendGoogleId) {
+  if (!accountsData.friends) return;
+  accountsData.friends[googleId] = (accountsData.friends[googleId] || []).filter(f => f !== friendGoogleId);
+  accountsData.friends[friendGoogleId] = (accountsData.friends[friendGoogleId] || []).filter(f => f !== googleId);
+  saveAccounts();
+}
+
+loadAccounts();
 
 // ─── Gift Catalog ───
 const GIFTS = {
@@ -491,6 +588,163 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
     }
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  // ACCOUNTS & AUTH
+  // ═══════════════════════════════════════════
+
+  // Google sign-in: verify token and create/update account
+  if (req.url === '/auth/google' && req.method === 'POST') {
+    try {
+      const data = await readBody(req);
+      // data: { googleId, email, name, username, gender, country }
+      if (!data.googleId || !data.email) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Google ID and email required' }));
+        return;
+      }
+
+      const username = (data.username || data.name || 'User').slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '');
+      if (username.length < 2) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Username must be 2-20 characters' }));
+        return;
+      }
+
+      // Check if username taken by someone else
+      if (isUsernameTakenByAccount(username, data.googleId)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Username is already taken' }));
+        return;
+      }
+
+      createOrUpdateAccount(data.googleId, {
+        username,
+        email: data.email,
+        gender: data.gender || '',
+        country: data.country || '',
+      });
+
+      const account = getAccount(data.googleId);
+      console.log(`[AUTH] ${username} signed in (${data.email})`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, account, googleId: data.googleId }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Get account profile
+  if (req.url?.startsWith('/auth/profile?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const gid = params.get('googleId');
+    if (gid) {
+      const acc = getAccount(gid);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ account: acc }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'googleId required' }));
+    }
+    return;
+  }
+
+  // Check username availability for accounts
+  if (req.url?.startsWith('/auth/check-username?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const name = params.get('name');
+    const gid = params.get('googleId') || '';
+    const taken = isUsernameTakenByAccount(name, gid);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ available: !taken }));
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  // FRIENDS API
+  // ═══════════════════════════════════════════
+
+  // Add friend by username
+  if (req.url === '/friends/add' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId || !data.friendUsername) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'googleId and friendUsername required' }));
+      return;
+    }
+    const friendAcc = getAccountByUsername(data.friendUsername);
+    if (!friendAcc) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'User not found or not signed in' }));
+      return;
+    }
+    if (friendAcc.googleId === data.googleId) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: "Can't add yourself" }));
+      return;
+    }
+    const existing = getFriends(data.googleId);
+    if (existing.includes(friendAcc.googleId)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Already friends' }));
+      return;
+    }
+    addFriend(data.googleId, friendAcc.googleId);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  // Remove friend
+  if (req.url === '/friends/remove' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId || !data.friendUsername) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'googleId and friendUsername required' }));
+      return;
+    }
+    const friendAcc = getAccountByUsername(data.friendUsername);
+    if (friendAcc) removeFriendFromList(data.googleId, friendAcc.googleId);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  // Get friends list
+  if (req.url?.startsWith('/friends/list?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const gid = params.get('googleId');
+    if (!gid) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'googleId required' })); return; }
+    const friendIds = getFriends(gid);
+    const friends = friendIds.map(fid => {
+      const acc = getAccount(fid);
+      if (!acc) return null;
+      // Check if online
+      let online = false;
+      clients.forEach((d) => { if (d.googleId === fid) online = true; });
+      return { username: acc.username, gender: acc.gender, country: acc.country, online, googleId: fid };
+    }).filter(Boolean);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ friends }));
+    return;
+  }
+
+  // Get DM history
+  if (req.url?.startsWith('/friends/messages?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const gid = params.get('googleId');
+    const friendUsername = params.get('friend');
+    if (!gid || !friendUsername) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'params required' })); return; }
+    const friendAcc = getAccountByUsername(friendUsername);
+    if (!friendAcc) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ messages: [] })); return; }
+    const msgs = getDMs(gid, friendAcc.googleId);
+    const mapped = msgs.map(m => ({ text: m.text, fromMe: m.from === gid, timestamp: m.timestamp }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ messages: mapped }));
     return;
   }
 
@@ -1007,9 +1261,11 @@ function pairUsers(ws1, ws2) {
   const p1 = getUserPerks(d1.ip);
   const p2 = getUserPerks(d2.ip);
   send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id,
-    partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance } });
+    partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance },
+    partnerSignedIn: !!d2.googleId });
   send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id,
-    partnerUsername: d1.username || 'Stranger', partnerPerks: { nameColor: p1.nameColor, bubbleTheme: p1.bubbleTheme, entrance: p1.entrance } });
+    partnerUsername: d1.username || 'Stranger', partnerPerks: { nameColor: p1.nameColor, bubbleTheme: p1.bubbleTheme, entrance: p1.entrance },
+    partnerSignedIn: !!d1.googleId });
   // Track recent partners for reconnect
   addRecentPartner(d1.ip, d2.id, d2.ip);
   addRecentPartner(d2.ip, d1.id, d1.ip);
@@ -1051,7 +1307,7 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '' });
+  clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '', googleId: null });
   send(ws, { type: 'welcome', id, online: clients.size, coins: getBalance(ip), perks: getUserPerks(ip) });
 
   ws.on('message', (raw) => {
@@ -1071,6 +1327,7 @@ wss.on('connection', (ws, req) => {
         unpairUser(ws); removeFromQueue(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : [];
         cd.username = typeof msg.username === 'string' ? msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '') : '';
+        if (msg.googleId) cd.googleId = msg.googleId;
         if (cd.username) setUsername(cd.ip, cd.username);
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
@@ -1101,6 +1358,7 @@ wss.on('connection', (ws, req) => {
         unpairUser(ws);
         cd.interests = Array.isArray(msg.interests) ? msg.interests.slice(0, 10) : cd.interests;
         if (typeof msg.username === 'string') { cd.username = msg.username.slice(0, 20).replace(/[^a-zA-Z0-9_]/g, ''); if (cd.username) setUsername(cd.ip, cd.username); }
+        if (msg.googleId) cd.googleId = msg.googleId;
         const m = findBestMatch(ws);
         if (m) pairUsers(ws, m.ws);
         else { waitingQueue.push(ws); send(ws, { type: 'waiting', position: waitingQueue.length }); }
@@ -1185,6 +1443,28 @@ wss.on('connection', (ws, req) => {
           send(ws, { type: 'coins_updated', balance: getBalance(cd.ip) });
           send(ws, { type: 'gift_error', message: 'Your last partner is not available right now.' });
         }
+        break;
+      }
+
+      // ─── Set Google ID for WS connection ───
+      case 'set_google_id': {
+        if (msg.googleId) cd.googleId = msg.googleId;
+        break;
+      }
+
+      // ─── DM via WebSocket ───
+      case 'dm_message': {
+        if (!cd.googleId || !msg.toUsername || !msg.text) break;
+        const targetAcc = getAccountByUsername(msg.toUsername);
+        if (!targetAcc) break;
+        // Save DM
+        saveDM(cd.googleId, targetAcc.googleId, msg.text.slice(0, 500));
+        // Deliver in real-time if target is online
+        clients.forEach((d, w) => {
+          if (d.googleId === targetAcc.googleId) {
+            send(w, { type: 'dm_incoming', fromUsername: cd.username, text: msg.text.slice(0, 500) });
+          }
+        });
         break;
       }
 
