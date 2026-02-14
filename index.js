@@ -1326,6 +1326,7 @@ const server = http.createServer(async (req, res) => {
     const paidUnbans = Object.entries(banData.bannedIPs).filter(([_, v]) => v.paid);
     const onlineUsers = [];
     clients.forEach((data, ws) => {
+      if (data.isBot) return; // Skip bots
       const ck = getCoinKey(data);
       onlineUsers.push({
         id: data.id,
@@ -1364,6 +1365,7 @@ const server = http.createServer(async (req, res) => {
       coinRevenue: coinsData.totalRevenue || 0,
       totalGifts: coinsData.totalGifts || 0,
       totalAccounts: Object.keys(accountsData.accounts).length,
+      activeBots: activeBots.size,
       recentBans: banData.banLog.slice(-50).reverse(),
       onlineUsers,
       registeredAccounts,
@@ -1620,12 +1622,32 @@ function pairUsers(ws1, ws2) {
   }
   const p1 = getUserPerks(getCoinKey(d1));
   const p2 = getUserPerks(getCoinKey(d2));
-  send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id,
-    partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance },
-    partnerSignedIn: !!d2.googleId });
-  send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id,
-    partnerUsername: d1.username || 'Stranger', partnerPerks: { nameColor: p1.nameColor, bubbleTheme: p1.bubbleTheme, entrance: p1.entrance },
-    partnerSignedIn: !!d1.googleId });
+
+  // Send matched to real users only (not bots)
+  if (!d1.isBot) {
+    send(ws1, { type: 'matched', role: 'initiator', sharedInterests: shared, partnerId: d2.id,
+      partnerUsername: d2.username || 'Stranger', partnerPerks: { nameColor: p2.nameColor, bubbleTheme: p2.bubbleTheme, entrance: p2.entrance },
+      partnerSignedIn: !!d2.googleId });
+  }
+  if (!d2.isBot) {
+    send(ws2, { type: 'matched', role: 'receiver', sharedInterests: shared, partnerId: d1.id,
+      partnerUsername: d1.username || 'Stranger', partnerPerks: { nameColor: p1.nameColor, bubbleTheme: p1.bubbleTheme, entrance: p1.entrance },
+      partnerSignedIn: !!d1.googleId });
+  }
+
+  // Bot sends greeting after a short delay
+  const botEntry = d1.isBot ? { botWs: ws1, humanWs: ws2, botData: d1 } : d2.isBot ? { botWs: ws2, humanWs: ws1, botData: d2 } : null;
+  if (botEntry && !botEntry.botData.greeted) {
+    botEntry.botData.greeted = true;
+    const greeting = botEntry.botData.persona.greetings[Math.floor(Math.random() * botEntry.botData.persona.greetings.length)];
+    setTimeout(() => {
+      const bd = clients.get(botEntry.botWs);
+      if (bd && bd.partner === botEntry.humanWs) {
+        send(botEntry.humanWs, { type: 'chat_message', text: greeting, from: 'stranger' });
+      }
+    }, 1500 + Math.random() * 2000);
+  }
+
   // Track recent partners for reconnect
   addRecentPartner(d1.ip, d2.id, d2.ip);
   addRecentPartner(d2.ip, d1.id, d1.ip);
@@ -1637,8 +1659,23 @@ function removeFromQueue(ws) { const i = waitingQueue.indexOf(ws); if (i !== -1)
 function unpairUser(ws) {
   const d = clients.get(ws);
   if (!d || !d.partner) return;
-  const pd = clients.get(d.partner);
-  if (pd) { connectedPairs.delete([d.id, pd.id].sort().join(':')); pd.partner = null; send(d.partner, { type: 'partner_disconnected' }); }
+  const partner = d.partner;
+  const pd = clients.get(partner);
+  if (pd) {
+    connectedPairs.delete([d.id, pd.id].sort().join(':'));
+    pd.partner = null;
+    if (!pd.isBot) {
+      send(partner, { type: 'partner_disconnected' });
+    } else {
+      // Re-queue the bot after a delay
+      pd.greeted = false;
+      pd.messageCount = 0;
+      pd.maxMessages = 8 + Math.floor(Math.random() * 15);
+      setTimeout(() => {
+        if (clients.has(partner) && !pd.partner) waitingQueue.push(partner);
+      }, 2000 + Math.random() * 3000);
+    }
+  }
   d.partner = null;
 }
 
@@ -1716,7 +1753,13 @@ wss.on('connection', (ws, req) => {
             send(ws, { type: 'warning', message: `⚠️ Warning ${cd.warnings}/2: ${result.reason}. Next violation = ban.` });
             break;
           }
-          send(cd.partner, { type: 'chat_message', text, from: 'stranger' });
+          // Check if partner is a bot
+          const partnerData = clients.get(cd.partner);
+          if (partnerData && partnerData.isBot) {
+            handleBotMessage(cd.partner, ws, text);
+          } else {
+            send(cd.partner, { type: 'chat_message', text, from: 'stranger' });
+          }
         }
         break;
       }
@@ -1864,9 +1907,280 @@ setInterval(() => {
 
 // ─── Online count broadcast ───
 setInterval(() => {
-  const c = clients.size;
-  wss.clients.forEach(ws => send(ws, { type: 'online_count', count: c }));
+  const realCount = clients.size;
+  const botCount = activeBots.size;
+  const displayCount = realCount + Math.floor(botCount * 0.5); // Show partial bot count
+  wss.clients.forEach(ws => send(ws, { type: 'online_count', count: displayCount }));
 }, 5000);
+
+// ═══════════════════════════════════════════
+// BOT SYSTEM (TEXT CHAT ONLY)
+// ═══════════════════════════════════════════
+const BOT_PERSONAS = [
+  { name: 'Luna', interests: ['music', 'movies', 'art'], greetings: ['hey!', 'hii', 'whats up!', 'heyyy', 'hola!'], personality: 'chill' },
+  { name: 'Jake', interests: ['gaming', 'sports', 'tech'], greetings: ['yo', 'hey', 'sup', 'whats good', 'heyy'], personality: 'casual' },
+  { name: 'Sophie', interests: ['travel', 'food', 'photography'], greetings: ['hi there!', 'hello!', 'heyyy', 'hey how are you'], personality: 'friendly' },
+  { name: 'Alex', interests: ['anime', 'gaming', 'music'], greetings: ['yoo', 'hey!', 'hi', 'hii whats up', 'heyo'], personality: 'energetic' },
+  { name: 'Maya', interests: ['books', 'art', 'music', 'movies'], greetings: ['hi!', 'hello', 'hey there', 'heyy'], personality: 'thoughtful' },
+  { name: 'Tyler', interests: ['sports', 'fitness', 'gaming'], greetings: ['sup', 'yo whats up', 'hey', 'whats good'], personality: 'bro' },
+  { name: 'Zoe', interests: ['fashion', 'travel', 'food', 'music'], greetings: ['hiii', 'heyyy!', 'omg hi', 'hello!'], personality: 'bubbly' },
+  { name: 'Kai', interests: ['tech', 'science', 'gaming', 'anime'], greetings: ['hey', 'hi', 'yo', 'hello there'], personality: 'nerdy' },
+  { name: 'Emma', interests: ['movies', 'cooking', 'travel'], greetings: ['hi!', 'hey!', 'hello :)', 'hii'], personality: 'warm' },
+  { name: 'Ryan', interests: ['music', 'sports', 'cars'], greetings: ['yo', 'hey man', 'sup', 'whats up'], personality: 'laid-back' },
+];
+
+const BOT_RESPONSES = {
+  chill: {
+    generic: ['oh nice', 'thats cool', 'lol', 'hmm yeah', 'for real', 'i feel that', 'same honestly', 'thats awesome', 'oh really?', 'haha yeah'],
+    question: ['wbu?', 'what about you?', 'do you?', 'have you?', 'really?'],
+    topics: ['so what do you do for fun?', 'where are you from?', 'whats your fav music?', 'watched anything good lately?', 'you into any hobbies?'],
+    farewell: ['gotta go, nice talking!', 'cya!', 'was fun chatting, bye!', 'catch you later!'],
+  },
+  casual: {
+    generic: ['nice', 'thats sick', 'no way', 'haha', 'oh word', 'thats dope', 'for sure', 'lol yeah', 'true true', 'bet'],
+    question: ['you?', 'wbu?', 'same?', 'fr?', 'really tho?'],
+    topics: ['you play any games?', 'what music you into?', 'where you from?', 'you watch sports?', 'got any plans this weekend?'],
+    farewell: ['ight im out, peace', 'later!', 'gotta bounce, nice chat', 'peace out!'],
+  },
+  friendly: {
+    generic: ['oh thats so cool!', 'I love that!', 'thats amazing', 'aw thats nice', 'wow really?', 'haha thats funny', 'oh nice!', 'so cool', 'I totally agree'],
+    question: ['what about you?', 'have you tried that?', 'do you like that too?', 'whats yours?'],
+    topics: ['so tell me about yourself!', 'whats the best trip youve taken?', 'do you cook?', 'whats your dream vacation?', 'any pets?'],
+    farewell: ['it was so nice talking to you!', 'bye! have a great day!', 'gotta run, take care!', 'lovely chatting with you!'],
+  },
+  energetic: {
+    generic: ['YOOO', 'thats so fire', 'no wayy', 'haha thats great', 'omg', 'lets gooo', 'sickk', 'bro thats awesome', 'W', 'lmaooo'],
+    question: ['you too?', 'fr??', 'wait really?', 'no cap?'],
+    topics: ['bro you gotta watch this anime', 'whats your top game rn?', 'you listen to any good music lately?', 'whats your go-to snack?'],
+    farewell: ['yo gotta go, was fire chatting!', 'laterrr!', 'peace!! was fun', 'ight catch you around!'],
+  },
+  thoughtful: {
+    generic: ['hmm interesting', 'I can see that', 'thats a good point', 'oh I like that', 'yeah I think so too', 'thats really cool actually', 'mmm yeah'],
+    question: ['what makes you say that?', 'how did you get into that?', 'what do you think about it?', 'whats your take?'],
+    topics: ['read any good books lately?', 'what kind of art do you like?', 'if you could go anywhere, where?', 'whats something youre passionate about?'],
+    farewell: ['this was a nice conversation, thank you!', 'I enjoyed this chat, bye!', 'take care, it was lovely talking!'],
+  },
+  bro: {
+    generic: ['bro thats sick', 'no way dude', 'haha facts', 'thats lit', 'W bro', 'nah fr', 'goated', 'ong', 'valid', 'lol'],
+    question: ['you lift?', 'fr?', 'what team you support?', 'you?'],
+    topics: ['you into any sports?', 'hit the gym today?', 'what games you play?', 'bro whats your workout split?'],
+    farewell: ['ight bro gotta go, stay hard', 'laterr bro', 'peace out dude', 'catch you later man'],
+  },
+  bubbly: {
+    generic: ['omg yesss', 'I love that so much!', 'aw thats adorable', 'haha sameee', 'noo wayyyy', 'stoppp thats amazing', 'yesss queen', 'lolol', 'literally me'],
+    question: ['OMG same?? you too?', 'wait really??', 'tell me moree!', 'whats yours?'],
+    topics: ['ok but whats your fav food??', 'have you traveled anywhere fun?', 'whats your aesthetic?', 'besttt song right now?'],
+    farewell: ['byeee it was so fun talking!!', 'gotta go love, byee!', 'this was so fun!! cya!', 'muah bye!!'],
+  },
+  nerdy: {
+    generic: ['oh thats interesting', 'I didnt know that', 'huh cool', 'yeah that makes sense', 'nice', 'I agree', 'thats fair', 'good point'],
+    question: ['how so?', 'why do you think that?', 'what got you into that?', 'do you know about...?'],
+    topics: ['whats your fav programming language?', 'you into space stuff?', 'played any good RPGs?', 'any tech you find interesting?', 'you seen any good sci fi?'],
+    farewell: ['gotta log off, nice chat', 'was good talking, bye', 'catch you later!', 'signing off, take care'],
+  },
+  warm: {
+    generic: ['aw thats nice!', 'haha yes!', 'I love that', 'oh how fun!', 'thats really sweet', 'oh nice!', 'hehe', 'aww', 'that sounds great!'],
+    question: ['ooh whats yours?', 'really? tell me more!', 'how about you?', 'you like that too?'],
+    topics: ['whats your comfort food?', 'do you have any hobbies?', 'watched any good movies lately?', 'whats making you happy lately?'],
+    farewell: ['gotta go, it was really nice talking!', 'bye bye, take care!', 'lovely chat, have a good one!'],
+  },
+  'laid-back': {
+    generic: ['yeah man', 'chill', 'nice nice', 'haha true', 'sounds good', 'thats cool', 'for sure', 'i dig it', 'right on'],
+    question: ['you into that?', 'what about you?', 'you heard of it?', 'same?'],
+    topics: ['what kinda music you into?', 'do you follow any sports?', 'whats your dream car?', 'you play any instruments?'],
+    farewell: ['peace, was chill talking', 'later man', 'take it easy, cya', 'gotta roll, peace'],
+  },
+};
+
+const activeBots = new Map(); // botId -> botData
+const BOT_MIN = 3;  // Minimum bots always active
+const BOT_MAX = 8;  // Maximum bots
+
+// Fake WebSocket-like object for bots
+class BotSocket {
+  constructor(id) { this.id = id; this.readyState = 1; this._partner = null; }
+  send() {} // Bots don't actually receive WebSocket messages
+  close() { this.readyState = 3; }
+  terminate() { this.readyState = 3; }
+}
+
+function createBot() {
+  const persona = BOT_PERSONAS[Math.floor(Math.random() * BOT_PERSONAS.length)];
+  const botId = `bot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const botWs = new BotSocket(botId);
+
+  const botData = {
+    id: botId,
+    ip: `bot_${botId}`,
+    interests: persona.interests.slice(0, 2 + Math.floor(Math.random() * 2)),
+    partner: null,
+    alive: true,
+    warnings: 0,
+    username: persona.name,
+    googleId: null,
+    mode: 'text', // Bots only in text chat
+    isBot: true,
+    persona: persona,
+    messageCount: 0,
+    maxMessages: 8 + Math.floor(Math.random() * 15), // 8-22 messages per conversation
+    lastMsgTime: 0,
+    greeted: false,
+  };
+
+  clients.set(botWs, botData);
+  activeBots.set(botId, { ws: botWs, data: botData });
+
+  // Add to text queue
+  waitingQueue.push(botWs);
+  console.log(`[BOT] ${persona.name} joined text chat queue`);
+  return botWs;
+}
+
+function removeBotCleanly(botId) {
+  const bot = activeBots.get(botId);
+  if (!bot) return;
+  const { ws, data } = bot;
+
+  // If bot has a partner, notify them
+  if (data.partner) {
+    const partnerData = clients.get(data.partner);
+    if (partnerData) {
+      send(data.partner, { type: 'partner_disconnected' });
+      partnerData.partner = null;
+    }
+  }
+
+  removeFromQueue(ws);
+  clients.delete(ws);
+  activeBots.delete(botId);
+  ws.close();
+}
+
+function getBotResponse(persona, userMessage) {
+  const responses = BOT_RESPONSES[persona.personality];
+  if (!responses) return 'haha yeah';
+
+  const lower = userMessage.toLowerCase();
+
+  // Respond to questions
+  if (lower.includes('?') || lower.includes('wbu') || lower.includes('you?') || lower.includes('about you')) {
+    // Topical answers
+    if (lower.includes('name') || lower.includes('who are you')) return `im ${persona.name}!`;
+    if (lower.includes('where') || lower.includes('from')) {
+      const places = ['US', 'Canada', 'UK', 'somewhere in Europe', 'Cali', 'New York', 'Texas', 'Florida', 'Chicago'];
+      return places[Math.floor(Math.random() * places.length)];
+    }
+    if (lower.includes('age') || lower.includes('old are')) {
+      return `${17 + Math.floor(Math.random() * 8)} haha`;
+    }
+    if (lower.includes('hobby') || lower.includes('fun') || lower.includes('do for')) {
+      return `i really like ${persona.interests[Math.floor(Math.random() * persona.interests.length)]}! ${responses.question[Math.floor(Math.random() * responses.question.length)]}`;
+    }
+    // Generic question response
+    const r = responses.generic[Math.floor(Math.random() * responses.generic.length)];
+    return r + ' ' + responses.question[Math.floor(Math.random() * responses.question.length)];
+  }
+
+  // Greetings
+  if (['hi', 'hey', 'hello', 'hii', 'heyy', 'heyyy', 'yo', 'sup', 'whats up', 'hola'].some(g => lower.startsWith(g))) {
+    const greeting = persona.greetings[Math.floor(Math.random() * persona.greetings.length)];
+    if (Math.random() > 0.5) return greeting + ' ' + responses.question[Math.floor(Math.random() * responses.question.length)];
+    return greeting;
+  }
+
+  // Topic starters (sometimes ask a question back)
+  if (Math.random() < 0.3) {
+    return responses.topics[Math.floor(Math.random() * responses.topics.length)];
+  }
+
+  // Generic response
+  const gen = responses.generic[Math.floor(Math.random() * responses.generic.length)];
+  if (Math.random() < 0.35) {
+    return gen + ' ' + responses.question[Math.floor(Math.random() * responses.question.length)];
+  }
+  return gen;
+}
+
+// Handle messages sent TO a bot
+function handleBotMessage(botWs, fromWs, text) {
+  const botData = clients.get(botWs);
+  if (!botData || !botData.isBot) return;
+
+  botData.messageCount++;
+
+  // If max messages reached, bot "skips"
+  if (botData.messageCount >= botData.maxMessages) {
+    setTimeout(() => {
+      const bd = clients.get(botWs);
+      if (bd && bd.partner) {
+        send(bd.partner, { type: 'partner_disconnected' });
+        const partnerData = clients.get(bd.partner);
+        if (partnerData) partnerData.partner = null;
+        bd.partner = null;
+        bd.messageCount = 0;
+        bd.maxMessages = 8 + Math.floor(Math.random() * 15);
+        bd.greeted = false;
+        // Re-queue the bot
+        waitingQueue.push(botWs);
+      }
+    }, 1000 + Math.random() * 2000);
+    return;
+  }
+
+  // Generate response with realistic delay
+  const delay = 800 + Math.random() * 2500; // 0.8-3.3 seconds
+  setTimeout(() => {
+    const bd = clients.get(botWs);
+    if (!bd || !bd.partner || bd.partner !== fromWs) return;
+    const response = getBotResponse(bd.persona, text);
+    send(fromWs, { type: 'chat_message', text: response, from: 'stranger' });
+  }, delay);
+}
+
+// Bot management loop
+setInterval(() => {
+  // Remove stale bots
+  activeBots.forEach((bot, botId) => {
+    const d = clients.get(bot.ws);
+    if (!d) { activeBots.delete(botId); return; }
+  });
+
+  // Ensure minimum bots exist
+  const currentBots = activeBots.size;
+  if (currentBots < BOT_MIN) {
+    const toCreate = BOT_MIN - currentBots;
+    for (let i = 0; i < toCreate; i++) createBot();
+  }
+
+  // Add more bots if few real users are waiting in text queue
+  const textWaiting = waitingQueue.filter(ws => {
+    const d = clients.get(ws);
+    return d && d.mode === 'text' && !d.isBot;
+  }).length;
+
+  if (textWaiting > 0 && activeBots.size < BOT_MAX) {
+    createBot(); // Add a bot to match with waiting user
+  }
+
+  // Remove excess idle bots (not paired)
+  if (activeBots.size > BOT_MAX) {
+    let removed = 0;
+    activeBots.forEach((bot, botId) => {
+      if (removed >= activeBots.size - BOT_MAX) return;
+      const d = clients.get(bot.ws);
+      if (d && !d.partner) {
+        removeBotCleanly(botId);
+        removed++;
+      }
+    });
+  }
+}, 5000);
+
+// Start initial bots
+setTimeout(() => {
+  for (let i = 0; i < BOT_MIN; i++) createBot();
+  console.log(`[BOT] Started ${BOT_MIN} initial chat bots`);
+}, 2000);
 
 // ─── Start ───
 server.listen(PORT, () => {
