@@ -59,6 +59,7 @@ function createOrUpdateAccount(googleId, data) {
     country: data.country || existing?.country || '',
     bio: data.bio !== undefined ? data.bio : (existing?.bio || ''),
     lastUsernameChange: data.lastUsernameChange || existing?.lastUsernameChange || null,
+    ownedFilters: existing?.ownedFilters || [],
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -1026,6 +1027,63 @@ const server = http.createServer(async (req, res) => {
   // ═══════════════════════════════════════════
   // M COINS API
   // ═══════════════════════════════════════════
+
+  // ═══ FILTERS ═══
+
+  // Get user's owned filters
+  if (req.url?.startsWith('/filters/mine')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const gid = params.get('googleId');
+    if (!gid) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ filters: [] })); return; }
+    const acc = getAccount(gid);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ filters: acc?.ownedFilters || [] }));
+    return;
+  }
+
+  // Buy a filter with M Coins
+  if (req.url === '/filters/buy' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId || !data.filterId || !data.cost) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing fields' }));
+      return;
+    }
+
+    const coinKey = `g:${data.googleId}`;
+    const acc = getAccount(data.googleId);
+    if (!acc) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account not found' })); return; }
+
+    // Check if already owned
+    if (acc.ownedFilters && acc.ownedFilters.includes(data.filterId)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, balance: getBalance(coinKey) }));
+      return;
+    }
+
+    // Spend coins
+    if (!spendCoins(coinKey, data.cost)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not enough coins', balance: getBalance(coinKey) }));
+      return;
+    }
+
+    // Add filter to account
+    if (!acc.ownedFilters) acc.ownedFilters = [];
+    acc.ownedFilters.push(data.filterId);
+    accountsData.accounts[data.googleId] = acc;
+    saveAccounts();
+
+    // Notify user's websocket
+    clients.forEach((d, ws) => {
+      if (d.googleId === data.googleId) send(ws, { type: 'coins_updated', balance: getBalance(coinKey) });
+    });
+
+    console.log(`[FILTER] ${acc.username} bought filter "${data.filterId}" for ${data.cost} coins`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, balance: getBalance(coinKey) }));
+    return;
+  }
 
   // Get coin balance
   if (req.url?.startsWith('/coins/balance')) {
