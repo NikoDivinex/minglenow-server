@@ -141,7 +141,29 @@ function trackGiftReceived(ip, amount) {
 
 function setUsername(ip, username) {
   if (!coinsData.usernames) coinsData.usernames = {};
-  if (username) coinsData.usernames[ip] = username;
+  if (!coinsData.usernameToIP) coinsData.usernameToIP = {};
+  if (username) {
+    // Remove old username claim for this IP
+    const oldName = coinsData.usernames[ip];
+    if (oldName && coinsData.usernameToIP[oldName.toLowerCase()] === ip) {
+      delete coinsData.usernameToIP[oldName.toLowerCase()];
+    }
+    coinsData.usernames[ip] = username;
+    coinsData.usernameToIP[username.toLowerCase()] = ip;
+    saveCoins();
+  }
+}
+
+function isUsernameTaken(username, requestingIP) {
+  if (!coinsData.usernameToIP) coinsData.usernameToIP = {};
+  const owner = coinsData.usernameToIP[username.toLowerCase()];
+  if (!owner) return false; // not taken
+  return owner !== requestingIP; // taken by someone else
+}
+
+function getUsernameForIP(ip) {
+  if (!coinsData.usernames) return null;
+  return coinsData.usernames[ip] || null;
 }
 
 function getLeaderboard(limit = 10) {
@@ -469,6 +491,60 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
     }
+    return;
+  }
+
+  // ═══════════════════════════════════════════
+  // USERNAME SYSTEM
+  // ═══════════════════════════════════════════
+
+  // Check if a username is available
+  if (req.url?.startsWith('/username/check?')) {
+    const params = new URL(req.url, `http://localhost`).searchParams;
+    const name = params.get('name');
+    const ip = getClientIP(req);
+    if (!name) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'name required' }));
+      return;
+    }
+    const taken = isUsernameTaken(name, ip);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ available: !taken, username: name }));
+    return;
+  }
+
+  // Claim / register a username
+  if (req.url === '/username/claim' && req.method === 'POST') {
+    const ip = getClientIP(req);
+    const data = await readBody(req);
+    const name = (data.username || '').trim().slice(0, 20).replace(/[^a-zA-Z0-9_]/g, '');
+
+    if (name.length < 2) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Username must be 2-20 characters' }));
+      return;
+    }
+
+    if (isUsernameTaken(name, ip)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Username is already taken' }));
+      return;
+    }
+
+    setUsername(ip, name);
+    console.log(`[USERNAME] ${ip.slice(0, 8)}*** claimed "${name}"`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, username: name }));
+    return;
+  }
+
+  // Get my saved username
+  if (req.url === '/username/mine') {
+    const ip = getClientIP(req);
+    const name = getUsernameForIP(ip);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ username: name }));
     return;
   }
 
