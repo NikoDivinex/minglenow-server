@@ -1,4 +1,4 @@
-aconst { WebSocketServer } = require('ws');
+const { WebSocketServer } = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
