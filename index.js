@@ -14,11 +14,12 @@ const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const UNBAN_PRICE_CENTS = 799; // $7.99
 
 // ─── Accounts Persistence ───
-let accountsData = { accounts: {}, usernameToId: {}, friends: {}, dms: {} };
+let accountsData = { accounts: {}, usernameToId: {}, friends: {}, dms: {}, pendingFriends: {} };
 // accounts: { "google_id": { username, email, gender, country, createdAt } }
 // usernameToId: { "username_lower": "google_id" }
 // friends: { "google_id": ["friend_google_id",...] }
-// dms: { "convo_key": [{ from, text, timestamp },...] }
+// dms: { "convo_key": [{ from, text, timestamp, image? },...] }
+// pendingFriends: { "google_id": ["requester_google_id",...] }  (incoming pending requests)
 
 function loadAccounts() {
   try {
@@ -75,11 +76,13 @@ function getDMs(id1, id2, limit = 50) {
   return (accountsData.dms[key] || []).slice(-limit);
 }
 
-function saveDM(fromId, toId, text) {
+function saveDM(fromId, toId, text, image) {
   const key = getDMKey(fromId, toId);
   if (!accountsData.dms) accountsData.dms = {};
   if (!accountsData.dms[key]) accountsData.dms[key] = [];
-  accountsData.dms[key].push({ from: fromId, text, timestamp: Date.now() });
+  const entry = { from: fromId, timestamp: Date.now() };
+  if (image) entry.image = image; else entry.text = text;
+  accountsData.dms[key].push(entry);
   if (accountsData.dms[key].length > 200) accountsData.dms[key] = accountsData.dms[key].slice(-200);
   saveAccounts();
 }
@@ -107,6 +110,36 @@ function removeFriendFromList(googleId, friendGoogleId) {
   accountsData.friends[googleId] = (accountsData.friends[googleId] || []).filter(f => f !== friendGoogleId);
   accountsData.friends[friendGoogleId] = (accountsData.friends[friendGoogleId] || []).filter(f => f !== googleId);
   saveAccounts();
+}
+
+function sendFriendRequest(fromId, toId) {
+  if (!accountsData.pendingFriends) accountsData.pendingFriends = {};
+  if (!accountsData.pendingFriends[toId]) accountsData.pendingFriends[toId] = [];
+  if (!accountsData.pendingFriends[toId].includes(fromId)) {
+    accountsData.pendingFriends[toId].push(fromId);
+    saveAccounts();
+  }
+}
+
+function acceptFriendRequest(acceptorId, requesterId) {
+  if (!accountsData.pendingFriends) return;
+  accountsData.pendingFriends[acceptorId] = (accountsData.pendingFriends[acceptorId] || []).filter(id => id !== requesterId);
+  addFriend(acceptorId, requesterId);
+}
+
+function declineFriendRequest(declinerId, requesterId) {
+  if (!accountsData.pendingFriends) return;
+  accountsData.pendingFriends[declinerId] = (accountsData.pendingFriends[declinerId] || []).filter(id => id !== requesterId);
+  saveAccounts();
+}
+
+function getPendingRequests(googleId) {
+  if (!accountsData.pendingFriends) return [];
+  const pending = accountsData.pendingFriends[googleId] || [];
+  return pending.map(id => {
+    const acc = accountsData.accounts[id];
+    return acc ? { googleId: id, username: acc.username } : null;
+  }).filter(Boolean);
 }
 
 loadAccounts();
@@ -906,9 +939,74 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ success: false, error: 'Already friends' }));
       return;
     }
-    addFriend(data.googleId, friendAcc.googleId);
+    // Check if there's already a pending request from this user
+    const pendingFrom = (accountsData.pendingFriends?.[friendAcc.googleId] || []);
+    if (pendingFrom.includes(data.googleId)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Friend request already sent' }));
+      return;
+    }
+    // Check if the other user already sent a request to us — auto-accept
+    const pendingToMe = (accountsData.pendingFriends?.[data.googleId] || []);
+    if (pendingToMe.includes(friendAcc.googleId)) {
+      acceptFriendRequest(data.googleId, friendAcc.googleId);
+      // Notify both via WebSocket if online
+      clients.forEach((d, w) => {
+        if (d.googleId === friendAcc.googleId || d.googleId === data.googleId) {
+          send(w, { type: 'friend_request_accepted', username: d.googleId === friendAcc.googleId ? accountsData.accounts[data.googleId]?.username : friendAcc.username });
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, accepted: true }));
+      return;
+    }
+    sendFriendRequest(data.googleId, friendAcc.googleId);
+    // Notify recipient via WebSocket if online
+    const myAcc = accountsData.accounts[data.googleId];
+    clients.forEach((d, w) => {
+      if (d.googleId === friendAcc.googleId) {
+        send(w, { type: 'friend_request_incoming', fromUsername: myAcc?.username, fromGoogleId: data.googleId });
+      }
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, pending: true }));
+    return;
+  }
+
+  // Accept friend request
+  if (req.url === '/friends/accept' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId || !data.requesterGoogleId) { res.writeHead(400); res.end('{}'); return; }
+    acceptFriendRequest(data.googleId, data.requesterGoogleId);
+    // Notify requester if online
+    const myAcc = accountsData.accounts[data.googleId];
+    clients.forEach((d, w) => {
+      if (d.googleId === data.requesterGoogleId) {
+        send(w, { type: 'friend_request_accepted', username: myAcc?.username });
+      }
+    });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  // Decline friend request
+  if (req.url === '/friends/decline' && req.method === 'POST') {
+    const data = await readBody(req);
+    if (!data.googleId || !data.requesterGoogleId) { res.writeHead(400); res.end('{}'); return; }
+    declineFriendRequest(data.googleId, data.requesterGoogleId);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  // Get pending friend requests
+  if (req.url?.startsWith('/friends/pending?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const gid = params.get('googleId');
+    if (!gid) { res.writeHead(400); res.end('{}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ pending: getPendingRequests(gid) }));
     return;
   }
 
@@ -955,7 +1053,7 @@ const server = http.createServer(async (req, res) => {
     const friendAcc = getAccountByUsername(friendUsername);
     if (!friendAcc) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ messages: [] })); return; }
     const msgs = getDMs(gid, friendAcc.googleId);
-    const mapped = msgs.map(m => ({ text: m.text, fromMe: m.from === gid, timestamp: m.timestamp }));
+    const mapped = msgs.map(m => ({ text: m.text, image: m.image, fromMe: m.from === gid, timestamp: m.timestamp }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ messages: mapped }));
     return;
@@ -1822,16 +1920,20 @@ wss.on('connection', (ws, req) => {
 
       // ─── DM via WebSocket ───
       case 'dm_message': {
-        if (!cd.googleId || !msg.toUsername || !msg.text) break;
+        if (!cd.googleId || !msg.toUsername) break;
+        if (!msg.text && !msg.image) break;
         const targetAcc = getAccountByUsername(msg.toUsername);
         if (!targetAcc) break;
+        // Validate image size (max ~2MB base64)
+        if (msg.image && msg.image.length > 2_800_000) break;
         // Save DM
-        saveDM(cd.googleId, targetAcc.googleId, msg.text.slice(0, 500));
+        const safeText = msg.text ? msg.text.slice(0, 500) : undefined;
+        saveDM(cd.googleId, targetAcc.googleId, safeText, msg.image);
         // Deliver in real-time if target is online
+        const outMsg = { type: 'dm_incoming', fromUsername: cd.username };
+        if (msg.image) outMsg.image = msg.image; else outMsg.text = safeText;
         clients.forEach((d, w) => {
-          if (d.googleId === targetAcc.googleId) {
-            send(w, { type: 'dm_incoming', fromUsername: cd.username, text: msg.text.slice(0, 500) });
-          }
+          if (d.googleId === targetAcc.googleId) send(w, outMsg);
         });
         break;
       }
