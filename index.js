@@ -1923,55 +1923,54 @@ wss.on('connection', (ws, req) => {
 
       // ─── Friend Connect Request ───
       case 'connect_friend': {
-        // User wants to start a live chat with a friend
         if (!cd.googleId || !msg.targetGoogleId) break;
-        // Find target friend's WS
         let targetWs = null;
         for (const [pws, pd] of clients.entries()) {
           if (pd.googleId === msg.targetGoogleId) { targetWs = pws; break; }
         }
-        if (!targetWs) {
-          send(ws, { type: 'friend_connect_error', message: 'Friend is not online right now.' });
-          break;
-        }
+        if (!targetWs) { send(ws, { type: 'friend_connect_error', message: 'Friend is not online right now.' }); break; }
         const td = clients.get(targetWs);
-        if (td.partner) {
-          send(ws, { type: 'friend_connect_error', message: 'Friend is already in a chat.' });
-          break;
-        }
-        if (cd.partner) {
-          send(ws, { type: 'friend_connect_error', message: 'You are already in a chat. Skip first.' });
-          break;
-        }
-        // Send request to the friend
         send(targetWs, { type: 'friend_connect_incoming', fromUsername: cd.username || 'Friend', fromGoogleId: cd.googleId });
         send(ws, { type: 'friend_connect_pending', toUsername: td.username || 'Friend' });
         break;
       }
       case 'friend_connect_respond': {
-        // User accepted or declined a friend connect request
         if (!cd.googleId || !msg.fromGoogleId) break;
         let requesterWs = null;
         for (const [pws, pd] of clients.entries()) {
           if (pd.googleId === msg.fromGoogleId) { requesterWs = pws; break; }
         }
-        if (msg.accepted) {
-          if (!requesterWs) {
-            send(ws, { type: 'friend_connect_error', message: 'Friend went offline before connecting.' });
-            break;
-          }
-          const rd = clients.get(requesterWs);
-          if (rd.partner || cd.partner) {
-            send(ws, { type: 'friend_connect_error', message: 'One of you is already in a chat.' });
-            if (requesterWs) send(requesterWs, { type: 'friend_connect_error', message: `${cd.username || 'Friend'} is already in a chat.` });
-            break;
-          }
-          unpairUser(ws); removeFromQueue(ws);
-          unpairUser(requesterWs); removeFromQueue(requesterWs);
-          pairUsers(ws, requesterWs);
-        } else {
+        if (!msg.accepted) {
           if (requesterWs) send(requesterWs, { type: 'friend_connect_declined', byUsername: cd.username || 'Friend' });
+          break;
         }
+        if (!requesterWs) { send(ws, { type: 'friend_connect_error', message: 'Friend went offline.' }); break; }
+        // Generate a one-time session token for both to rendezvous cleanly
+        const sessionToken = `fs_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        send(ws,         { type: 'friend_session_ready', sessionToken, role: 'receiver',  partnerUsername: clients.get(requesterWs)?.username || 'Friend' });
+        send(requesterWs,{ type: 'friend_session_ready', sessionToken, role: 'initiator', partnerUsername: cd.username || 'Friend' });
+        break;
+      }
+      case 'friend_join': {
+        // Clean join for friend session — skip queue, wait for partner with same token
+        if (!msg.sessionToken) break;
+        cd.friendSessionToken = msg.sessionToken;
+        cd.friendRole = msg.role;
+        if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.username) { cd.username = msg.username; setUsername(cd.ip, cd.username); }
+        if (msg.mode) cd.mode = msg.mode;
+        unpairUser(ws); removeFromQueue(ws);
+        // Find partner waiting with same token
+        let partnerWs = null;
+        for (const [pws, pd] of clients.entries()) {
+          if (pws !== ws && pd.friendSessionToken === msg.sessionToken) { partnerWs = pws; break; }
+        }
+        if (partnerWs) {
+          clients.get(ws).friendSessionToken = null;
+          clients.get(partnerWs).friendSessionToken = null;
+          pairUsers(ws, partnerWs);
+        }
+        // else wait — partner will find us when they join
         break;
       }
 
