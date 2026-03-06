@@ -1918,6 +1918,60 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ─── Friend Connect Request ───
+      case 'connect_friend': {
+        // User wants to start a live chat with a friend
+        if (!cd.googleId || !msg.targetGoogleId) break;
+        // Find target friend's WS
+        let targetWs = null;
+        for (const [pws, pd] of clients.entries()) {
+          if (pd.googleId === msg.targetGoogleId) { targetWs = pws; break; }
+        }
+        if (!targetWs) {
+          send(ws, { type: 'friend_connect_error', message: 'Friend is not online right now.' });
+          break;
+        }
+        const td = clients.get(targetWs);
+        if (td.partner) {
+          send(ws, { type: 'friend_connect_error', message: 'Friend is already in a chat.' });
+          break;
+        }
+        if (cd.partner) {
+          send(ws, { type: 'friend_connect_error', message: 'You are already in a chat. Skip first.' });
+          break;
+        }
+        // Send request to the friend
+        send(targetWs, { type: 'friend_connect_incoming', fromUsername: cd.username || 'Friend', fromGoogleId: cd.googleId });
+        send(ws, { type: 'friend_connect_pending', toUsername: td.username || 'Friend' });
+        break;
+      }
+      case 'friend_connect_respond': {
+        // User accepted or declined a friend connect request
+        if (!cd.googleId || !msg.fromGoogleId) break;
+        let requesterWs = null;
+        for (const [pws, pd] of clients.entries()) {
+          if (pd.googleId === msg.fromGoogleId) { requesterWs = pws; break; }
+        }
+        if (msg.accepted) {
+          if (!requesterWs) {
+            send(ws, { type: 'friend_connect_error', message: 'Friend went offline before connecting.' });
+            break;
+          }
+          const rd = clients.get(requesterWs);
+          if (rd.partner || cd.partner) {
+            send(ws, { type: 'friend_connect_error', message: 'One of you is already in a chat.' });
+            if (requesterWs) send(requesterWs, { type: 'friend_connect_error', message: `${cd.username || 'Friend'} is already in a chat.` });
+            break;
+          }
+          unpairUser(ws); removeFromQueue(ws);
+          unpairUser(requesterWs); removeFromQueue(requesterWs);
+          pairUsers(ws, requesterWs);
+        } else {
+          if (requesterWs) send(requesterWs, { type: 'friend_connect_declined', byUsername: cd.username || 'Friend' });
+        }
+        break;
+      }
+
       // ─── DM via WebSocket ───
       case 'dm_message': {
         if (!cd.googleId || !msg.toUsername) break;
