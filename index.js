@@ -1915,6 +1915,7 @@ wss.on('connection', (ws, req) => {
       // ─── Set Google ID for WS connection ───
       case 'set_google_id': {
         if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.username) cd.username = msg.username;
         break;
       }
 
@@ -1989,6 +1990,10 @@ wss.on('connection', (ws, req) => {
         clients.forEach((d, w) => {
           if (d.googleId === targetAcc.googleId) send(w, outMsg);
         });
+        // Echo back to sender so their DM history stays in sync if open on another device/tab
+        const echoMsg = { type: 'dm_sent', toUsername: msg.toUsername };
+        if (msg.image) echoMsg.image = msg.image; else echoMsg.text = safeText;
+        send(ws, echoMsg);
         break;
       }
 
