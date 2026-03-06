@@ -1654,7 +1654,6 @@ const wss = new WebSocketServer({ server });
 const clients = new Map();
 const waitingQueue = [];
 const connectedPairs = new Set();
-const groupRooms = new Map(); // roomId → { members: [{ws, peerId, googleId, username}] }
 let nextId = 1;
 
 function generateId() { return `user_${nextId++}_${Date.now().toString(36)}`; }
@@ -2006,92 +2005,11 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'pong': { cd.alive = true; break; }
-
-      // ─── Group Video Chat ───
-      case 'group_invite': {
-        if (!msg.roomId || !msg.toGoogleId || !cd.googleId) break;
-        const room = groupRooms.get(msg.roomId);
-        if (room && room.members.length >= 4) { send(ws, { type: 'group_full', roomId: msg.roomId }); break; }
-        // Find target ws
-        let toWs = null;
-        for (const [pws, pd] of clients.entries()) {
-          if (pd.googleId === msg.toGoogleId) { toWs = pws; break; }
-        }
-        if (!toWs) { send(ws, { type: 'friend_connect_error', message: 'That friend is offline.' }); break; }
-        send(toWs, { type: 'group_invite_incoming', roomId: msg.roomId, fromUsername: cd.username || 'Friend', fromGoogleId: cd.googleId });
-        break;
-      }
-
-      case 'group_invite_respond': {
-        if (!msg.roomId) break;
-        if (!msg.accepted) {
-          // Find inviter (anyone in or who created the room)
-          const room = groupRooms.get(msg.roomId);
-          if (room && room.members.length > 0) {
-            const inviterWs = room.members[0].ws;
-            send(inviterWs, { type: 'group_invite_declined', byUsername: cd.username || 'Friend' });
-          }
-          break;
-        }
-        // Join the room
-        if (msg.googleId) cd.googleId = msg.googleId;
-        if (msg.username) { cd.username = msg.username; setUsername(cd.ip, cd.username); }
-        let room = groupRooms.get(msg.roomId);
-        if (!room) { room = { members: [] }; groupRooms.set(msg.roomId, room); }
-        if (room.members.length >= 4) { send(ws, { type: 'group_full', roomId: msg.roomId }); break; }
-        const peerId = cd.id;
-        // Tell joining user about existing members
-        send(ws, { type: 'group_joined', roomId: msg.roomId, peerId,
-          members: room.members.map(m => ({ peerId: m.peerId, username: m.username })) });
-        // Tell existing members about new joiner
-        for (const m of room.members) {
-          send(m.ws, { type: 'group_member_joined', roomId: msg.roomId, peerId, username: cd.username || 'Member' });
-        }
-        room.members.push({ ws, peerId, googleId: cd.googleId, username: cd.username || 'Member' });
-        break;
-      }
-
-      case 'group_leave': {
-        if (!msg.roomId) break;
-        const room = groupRooms.get(msg.roomId);
-        if (!room) break;
-        const idx = room.members.findIndex(m => m.ws === ws);
-        if (idx === -1) break;
-        const leaving = room.members.splice(idx, 1)[0];
-        for (const m of room.members) {
-          send(m.ws, { type: 'group_member_left', roomId: msg.roomId, peerId: leaving.peerId, username: leaving.username });
-        }
-        if (room.members.length === 0) groupRooms.delete(msg.roomId);
-        break;
-      }
-
-      case 'group_rtc_offer': case 'group_rtc_answer': case 'group_rtc_ice': {
-        if (!msg.roomId || !msg.toPeerId) break;
-        const room = groupRooms.get(msg.roomId);
-        if (!room) break;
-        const target = room.members.find(m => m.peerId === msg.toPeerId);
-        if (!target) break;
-        // Add sender's peerId and username to forwarded message
-        const forward = { ...msg, fromPeerId: cd.id, fromUsername: cd.username || 'Member' };
-        send(target.ws, forward);
-        break;
-      }
     }
   });
 
   ws.on('close', () => {
     const d = clients.get(ws);
-    // Leave any group rooms
-    for (const [roomId, room] of groupRooms.entries()) {
-      const idx = room.members.findIndex(m => m.ws === ws);
-      if (idx !== -1) {
-        const leaving = room.members.splice(idx, 1)[0];
-        for (const m of room.members) {
-          send(m.ws, { type: 'group_member_left', roomId, peerId: leaving.peerId, username: leaving.username });
-        }
-        if (room.members.length === 0) groupRooms.delete(roomId);
-      }
-    }
     unpairUser(ws); removeFromQueue(ws); clients.delete(ws);
     broadcastOnlineCount();
   });
