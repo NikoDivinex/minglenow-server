@@ -1768,6 +1768,8 @@ wss.on('connection', (ws, req) => {
 
   clients.set(ws, { id, ip, interests: [], partner: null, alive: true, warnings: 0, username: '', googleId: null, mode: 'video' });
   send(ws, { type: 'welcome', id, online: clients.size });
+  // Broadcast updated count to everyone immediately
+  broadcastOnlineCount();
 
   ws.on('message', (raw) => {
     let msg;
@@ -2010,8 +2012,9 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     const d = clients.get(ws);
     unpairUser(ws); removeFromQueue(ws); clients.delete(ws);
+    broadcastOnlineCount();
   });
-  ws.on('error', () => { unpairUser(ws); removeFromQueue(ws); clients.delete(ws); });
+  ws.on('error', () => { unpairUser(ws); removeFromQueue(ws); clients.delete(ws); broadcastOnlineCount(); });
 });
 
 // ─── Heartbeat ───
@@ -2025,10 +2028,11 @@ setInterval(() => {
 }, HEARTBEAT_INTERVAL);
 
 // ─── Online count broadcast ───
-setInterval(() => {
+function broadcastOnlineCount() {
   const c = clients.size;
   wss.clients.forEach(ws => send(ws, { type: 'online_count', count: c }));
-}, 5000);
+}
+setInterval(broadcastOnlineCount, 2000);
 
 // ─── Start ───
 server.listen(PORT, () => {
