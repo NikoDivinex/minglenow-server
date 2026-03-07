@@ -1656,6 +1656,58 @@ const waitingQueue = [];
 const connectedPairs = new Set();
 let nextId = 1;
 
+// ─── Group Rooms (4-person video chat with room codes) ───
+const groupRooms = new Map(); // roomCode -> { members: [ws,...], host: ws, createdAt }
+
+function generateRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+function getRoomForWs(ws) {
+  for (const [code, room] of groupRooms.entries()) {
+    if (room.members.includes(ws)) return { code, room };
+  }
+  return null;
+}
+
+function broadcastToRoom(roomCode, data, excludeWs = null) {
+  const room = groupRooms.get(roomCode);
+  if (!room) return;
+  for (const memberWs of room.members) {
+    if (memberWs !== excludeWs && memberWs.readyState === 1) {
+      send(memberWs, data);
+    }
+  }
+}
+
+function leaveGroupRoom(ws) {
+  const found = getRoomForWs(ws);
+  if (!found) return;
+  const { code, room } = found;
+  const cd = clients.get(ws);
+  room.members = room.members.filter(m => m !== ws);
+  if (cd) cd.groupRoom = null;
+  broadcastToRoom(code, {
+    type: 'group_member_left',
+    userId: cd?.id,
+    username: cd?.username || 'Someone',
+    memberCount: room.members.length,
+    members: room.members.map(m => { const d = clients.get(m); return { id: d?.id, username: d?.username || 'Stranger' }; }),
+  });
+  if (room.members.length === 0) {
+    groupRooms.delete(code);
+    console.log(`[GROUP] Room ${code} dissolved (empty)`);
+  } else if (room.host === ws) {
+    // Pass host to next member
+    room.host = room.members[0];
+    send(room.host, { type: 'group_you_are_host' });
+    console.log(`[GROUP] Room ${code} host transferred`);
+  }
+}
+
 function generateId() { return `user_${nextId++}_${Date.now().toString(36)}`; }
 
 function calculateMatchScore(a, b) {
@@ -2004,16 +2056,136 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ─── Group Room: Create ───
+      case 'group_create': {
+        // Leave any existing room first
+        leaveGroupRoom(ws);
+        unpairUser(ws); removeFromQueue(ws);
+        let code = generateRoomCode();
+        // Ensure unique code
+        while (groupRooms.has(code)) code = generateRoomCode();
+        if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.username) { cd.username = msg.username; setUsername(cd.ip, cd.username); }
+        cd.mode = 'group';
+        cd.groupRoom = code;
+        groupRooms.set(code, { members: [ws], host: ws, createdAt: Date.now() });
+        send(ws, {
+          type: 'group_created',
+          roomCode: code,
+          userId: cd.id,
+          username: cd.username || 'Host',
+          members: [{ id: cd.id, username: cd.username || 'Host' }],
+        });
+        console.log(`[GROUP] Room ${code} created by ${cd.username || cd.id}`);
+        break;
+      }
+
+      // ─── Group Room: Join ───
+      case 'group_join': {
+        if (!msg.roomCode) { send(ws, { type: 'group_error', message: 'Room code required' }); break; }
+        const code = msg.roomCode.toString().toUpperCase().trim();
+        const room = groupRooms.get(code);
+        if (!room) { send(ws, { type: 'group_error', message: 'Room not found. Check the code and try again.' }); break; }
+        if (room.members.length >= 4) { send(ws, { type: 'group_error', message: 'Room is full (max 4 people).' }); break; }
+        // Check not already in room
+        if (room.members.includes(ws)) { send(ws, { type: 'group_error', message: 'Already in this room.' }); break; }
+        leaveGroupRoom(ws);
+        unpairUser(ws); removeFromQueue(ws);
+        if (msg.googleId) cd.googleId = msg.googleId;
+        if (msg.username) { cd.username = msg.username; setUsername(cd.ip, cd.username); }
+        cd.mode = 'group';
+        cd.groupRoom = code;
+        room.members.push(ws);
+        const memberList = room.members.map(m => { const d = clients.get(m); return { id: d?.id, username: d?.username || 'Stranger' }; });
+        send(ws, {
+          type: 'group_joined',
+          roomCode: code,
+          userId: cd.id,
+          members: memberList,
+        });
+        broadcastToRoom(code, {
+          type: 'group_member_joined',
+          userId: cd.id,
+          username: cd.username || 'Stranger',
+          memberCount: room.members.length,
+          members: memberList,
+        }, ws);
+        console.log(`[GROUP] ${cd.username || cd.id} joined room ${code} (${room.members.length}/4)`);
+        break;
+      }
+
+      // ─── Group Room: Leave ───
+      case 'group_leave': {
+        leaveGroupRoom(ws);
+        send(ws, { type: 'group_left' });
+        break;
+      }
+
+      // ─── Group Room: Chat message ───
+      case 'group_chat': {
+        if (!cd.groupRoom || typeof msg.text !== 'string') break;
+        const text = msg.text.slice(0, 500).trim();
+        if (!text) break;
+        const check = checkMessage(text);
+        if (check.action === 'ban') { disconnectAndBan(ws, check.reason); break; }
+        if (check.action === 'warn') {
+          send(ws, { type: 'warning', message: check.reason });
+          if (trackWarning(cd.ip)) { disconnectAndBan(ws, 'Repeated harmful language'); break; }
+        }
+        broadcastToRoom(cd.groupRoom, {
+          type: 'group_chat',
+          from: cd.username || 'Stranger',
+          userId: cd.id,
+          text,
+          timestamp: Date.now(),
+        }, null);
+        break;
+      }
+
+      // ─── Group Room: WebRTC signaling (multi-peer) ───
+      case 'group_rtc_offer':
+      case 'group_rtc_answer':
+      case 'group_rtc_ice': {
+        if (!cd.groupRoom || !msg.targetId) break;
+        const room = groupRooms.get(cd.groupRoom);
+        if (!room) break;
+        for (const memberWs of room.members) {
+          const md = clients.get(memberWs);
+          if (md && md.id === msg.targetId) {
+            send(memberWs, { ...msg, fromId: cd.id });
+            break;
+          }
+        }
+        break;
+      }
+
+      // ─── Group Room: Get room info ───
+      case 'group_info': {
+        if (!msg.roomCode) break;
+        const code = msg.roomCode.toUpperCase().trim();
+        const room = groupRooms.get(code);
+        if (!room) { send(ws, { type: 'group_error', message: 'Room not found.' }); break; }
+        send(ws, {
+          type: 'group_info',
+          roomCode: code,
+          memberCount: room.members.length,
+          full: room.members.length >= 4,
+          members: room.members.map(m => { const d = clients.get(m); return { id: d?.id, username: d?.username || 'Stranger' }; }),
+        });
+        break;
+      }
+
       case 'pong': { cd.alive = true; break; }
     }
   });
 
   ws.on('close', () => {
     const d = clients.get(ws);
+    leaveGroupRoom(ws);
     unpairUser(ws); removeFromQueue(ws); clients.delete(ws);
     broadcastOnlineCount();
   });
-  ws.on('error', () => { unpairUser(ws); removeFromQueue(ws); clients.delete(ws); broadcastOnlineCount(); });
+  ws.on('error', () => { leaveGroupRoom(ws); unpairUser(ws); removeFromQueue(ws); clients.delete(ws); broadcastOnlineCount(); });
 });
 
 // ─── Heartbeat ───
