@@ -2075,6 +2075,7 @@ wss.on('connection', (ws, req) => {
           userId: cd.id,
           username: cd.username || 'Host',
           members: [{ id: cd.id, username: cd.username || 'Host' }],
+          isHost: true,
         });
         console.log(`[GROUP] Room ${code} created by ${cd.username || cd.id}`);
         break;
@@ -2102,6 +2103,9 @@ wss.on('connection', (ws, req) => {
           roomCode: code,
           userId: cd.id,
           members: memberList,
+          isHost: false,
+          hostId: clients.get(room.host)?.id,
+          callStarted: room.callStarted || false,
         });
         broadcastToRoom(code, {
           type: 'group_member_joined',
@@ -2156,6 +2160,24 @@ wss.on('connection', (ws, req) => {
             break;
           }
         }
+        break;
+      }
+
+      // ─── Group Room: Host starts the call ───
+      case 'group_call_start': {
+        if (!cd.groupRoom) break;
+        const room = groupRooms.get(cd.groupRoom);
+        if (!room) break;
+        // Only host can start the call
+        if (room.host !== ws) { send(ws, { type: 'group_error', message: 'Only the host can start the call.' }); break; }
+        if (room.members.length < 2) { send(ws, { type: 'group_error', message: 'Need at least 2 people to start.' }); break; }
+        room.callStarted = true;
+        const memberList = room.members.map(m => { const d = clients.get(m); return { id: d?.id, username: d?.username || 'Stranger' }; });
+        broadcastToRoom(cd.groupRoom, {
+          type: 'group_call_started',
+          members: memberList,
+        }, null);
+        console.log(`[GROUP] Call started in room ${cd.groupRoom} by host ${cd.username || cd.id}`);
         break;
       }
 
